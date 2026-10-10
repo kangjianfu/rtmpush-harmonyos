@@ -14,7 +14,7 @@
 **方式二：git submodule**（推荐，版本可锁定）
 
 ```bash
-git submodule add https://git.ycan.cn/kangjianfu/rtmpush-harmonyos.git deps/rtmpush-harmonyos
+git submodule add https://github.com/<your-org>/rtmpush-harmonyos.git deps/rtmpush-harmonyos
 # oh-package.json5 里："rtmpush": "file:../deps/rtmpush-harmonyos/library"
 ```
 
@@ -44,9 +44,9 @@ hdc install demo/build/default/outputs/default/demo-default-unsigned.hap
 
 ## 特性
 
-- H.264（老 FLV tag）+ **H.265（Enhanced RTMP v2，hvc1）**，hvcC 序列头手工构建
+- H.264（老 FLV tag）+ **H.265（Enhanced RTMP，hvc1）**，hvcC 序列头手工构建
 - AAC-LC 音频，自动发 AudioSpecificConfig 序列头
--  digest 握手（阿里云等需要 FP9 鉴权的服务器可用）
+- digest 握手（FP9，与 librtmp 算法一致，阿里云等需要鉴权握手的服务器可用）
 - 编码帧回调队列有上限，ArkTS 卡顿时丢帧防 OOM
 
 ## 快速开始
@@ -84,9 +84,9 @@ await rtmp.connect('rtmp://your-server/app/streamKey');
 
 H.265 推流：`createVideo(..., 'video/hevc')`，config 帧里抽 VPS(32)/SPS(33)/PPS(34) 调 `rtmp.sendHevcConfig(vps, sps, pps, w, h, fps)`，推流前 `rtmp.setHevc(true)`。播放端需支持 Enhanced RTMP hvc1。
 
-自适应码流：用 `rtmp.getSendRateKbps()` 拿最近 3 秒实测上行速率，低于目标码流时调 `encoder.setVideoBitrate(kbps)` 动态降码率（参考实现见体云赛事 App 的 LivePush 页）。
+自适应码流：用 `rtmp.getSendRateKbps()` 拿最近 3 秒实测上行速率，低于目标码流时调 `encoder.setVideoBitrate(kbps)` 动态降码率。
 
-断线重连：挂 `rtmp.onClosed` 回调，断开后新建 `RtmpClient` 实例重连（相机/编码器不用停），重连成功后记得重发视频/音频序列头（新通道没有对端状态）。建议指数退避（1s 起、30s 封顶）。
+断线重连：挂 `rtmp.onClosed` 回调，断开后用同一实例重新 `connect()` 即可（相机/编码器不用停），重连成功后记得重发视频/音频序列头并 `encoder.requestKeyFrame()`（新通道没有对端状态）。建议指数退避（1s 起、30s 封顶）。
 
 ## 权限
 
@@ -115,4 +115,4 @@ Apache-2.0（见 [LICENSE](LICENSE)、[NOTICE](NOTICE)）
 
 ---
 
-由 [视创新云（北京）科技有限公司](https://www.widk.cn) 开源 · 体云动赛事平台（www.widk.cn）生产环境打磨
+由 [视创新云（北京）科技有限公司](https://www.widk.cn) 开源
