@@ -1,9 +1,11 @@
 {
   "name": "rtmpush",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "鸿蒙原生 RTMP 推流库：纯 ArkTS RTMP 协议栈 + native H.264/H.265 硬编 + AAC 音频，无第三方依赖",
   "main": "Index.ets",
   "author": "shichuangyun",
   "license": "Apache-2.0",
+  "homepage": "https://www.widk.cn",
+  "keywords": ["rtmp", "推流", "直播", "harmonyos", "h265", "hevc", "aac"],
   "dependencies": {}
 }

@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 Shichuangyun (Beijing) Technology Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // demo/pages/Index.ets — rtmpush 演示：输入 RTMP 地址，相机+麦克风采集推流
 // 覆盖 SDK 全功能：surface 零拷贝（失败回退 buffer）、H.264/H.265、AAC、动态码率
 import { promptAction } from '@kit.ArkUI';
@@ -7,7 +23,7 @@ import { audio } from '@kit.AudioKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { scanBarcode, scanCore } from '@kit.ScanKit';
 import { abilityAccessCtrl, common } from '@kit.AbilityKit';
-import { RtmpClient, PushEncoder, VideoCodec, CODEC_FLAG_SYNC, CODEC_FLAG_CONFIG } from 'rtmpush';
+import { RtmpClient, PushEncoder, VideoCodec, CODEC_FLAG_SYNC, CODEC_FLAG_CONFIG, splitAnnexB } from 'rtmpush';
 
 const RESOLUTIONS: number[][] = [[960, 540], [1280, 720], [1920, 1080]];
 const RES_LABELS: string[] = ['540p', '720p', '1080p'];
@@ -50,11 +66,19 @@ struct Index {
     this.rtmp.onLog = (msg: string) => {
       this.addLog(msg);
     };
+    this.rtmp.onClosed = () => {
+      this.addLog('连接断开，停止推流');
+      this.stopAll();
+    };
+    this.rtmp.onError = (msg: string) => {
+      this.addLog(msg);
+      promptAction.showToast({ message: msg });
+    };
     this.encoder.onVideoFrame((f) => {
-      this.onEncodedVideo(f.data, f.flags);
+      this.onEncodedVideo(f.data, f.flags, f.ptsUs);
     });
     this.encoder.onAudioFrame((f) => {
-      this.onEncodedAudio(f.data);
+      this.onEncodedAudio(f.data, f.ptsUs);
     });
   }
 
@@ -77,7 +101,7 @@ struct Index {
 
   // ---------------- 编码帧 → RTMP ----------------
 
-  private onEncodedVideo(data: ArrayBuffer, flags: number): void {
+  private onEncodedVideo(data: ArrayBuffer, flags: number, ptsUs: number): void {
     if (!this.pushing) {
       return;
     }
@@ -103,11 +127,11 @@ struct Index {
       }
       return;
     }
-    this.rtmp.sendVideoFrame(bytes, (flags & CODEC_FLAG_SYNC) !== 0, 0);
+    this.rtmp.sendVideoFrame(bytes, (flags & CODEC_FLAG_SYNC) !== 0, ptsUs / 1000);
     this.frameCount += 1;
   }
 
-  private onEncodedAudio(data: ArrayBuffer): void {
+  private onEncodedAudio(data: ArrayBuffer, ptsUs: number): void {
     if (!this.pushing) {
       return;
     }
@@ -115,30 +139,18 @@ struct Index {
       this.rtmp.sendAudioConfig();
       this.audioConfigSent = true;
     }
-    this.rtmp.sendAudioFrame(new Uint8Array(data));
+    this.rtmp.sendAudioFrame(new Uint8Array(data), ptsUs / 1000);
   }
 
   /** annex-b NAL 提取：AVC type=nal[0]&0x1f，HEVC type=(nal[0]>>1)&0x3f */
   private extractNal(annexb: Uint8Array, nalType: number, hevc: boolean): Uint8Array[] {
     const out: Uint8Array[] = [];
-    let start = -1;
-    for (let i = 0; i + 3 < annexb.length; i++) {
-      if (annexb[i] === 0 && annexb[i + 1] === 0 && annexb[i + 2] === 0 && annexb[i + 3] === 1) {
-        if (start >= 0) {
-          const nal = annexb.subarray(start, i);
-          const t = hevc ? (nal[0] >> 1) & 0x3f : nal[0] & 0x1f;
-          if (t === nalType) {
-            out.push(nal);
-          }
-        }
-        start = i + 4;
-        i += 3;
+    for (const nal of splitAnnexB(annexb)) {
+      if (nal.length === 0) {
+        continue;
       }
-    }
-    if (start >= 0) {
-      const nal = annexb.subarray(start);
       const t = hevc ? (nal[0] >> 1) & 0x3f : nal[0] & 0x1f;
-      if (nal.length > 0 && t === nalType) {
+      if (t === nalType) {
         out.push(nal);
       }
     }
@@ -237,7 +249,7 @@ struct Index {
       frameSurfaceId = this.encoderSurfaceId;
     } else {
       const receiver = image.createImageReceiver(this.videoW(), this.videoH(),
-        image.ImageFormat.YCBCR_422_SP, 8);
+        image.ImageFormat.YCRCB_420_SP, 8); // NV21，与编码器 OH_MD_KEY_PIXEL_FORMAT=3 对应
       this.receiver = receiver;
       receiver.on('imageArrival', () => {
         this.onCameraFrame(receiver);

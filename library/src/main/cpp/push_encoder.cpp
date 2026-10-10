@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 Shichuangyun (Beijing) Technology Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // push_encoder.cpp — 原生 H.264/H.265 编码器，NAPI 桥接到 ArkTS
 // buffer 模式：ArkTS ImageReceiver 拿 NV21 帧 → pushFrame 入队 → onNeedInputData 消费
 // surface 模式（零拷贝）：相机画面直通编码器 surface，无内存拷贝；CreateEncoderSurface 返回 surfaceId
@@ -26,10 +42,15 @@
 
 namespace {
 
+struct RawFrame {
+    std::vector<uint8_t> data;
+    int64_t pts; // 采集 pts（微秒），透传给编码器，保证输出 pts 同源
+};
+
 struct EncoderCtx {
     OH_AVCodec *codec = nullptr;
     napi_threadsafe_function tsfn = nullptr;
-    std::queue<std::vector<uint8_t>> pending;   // 待编码 NV21 帧（buffer 模式）
+    std::queue<RawFrame> pending;               // 待编码 NV21 帧（buffer 模式）
     std::mutex mtx;
     bool running = false;
     bool surfaceMode = false;                   // surface 零拷贝模式（相机直通）
@@ -62,15 +83,15 @@ void OnNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, void 
     if (!g_ctx.running || g_ctx.pending.empty() || !data) {
         return; // 没帧就跳过这轮（buffer 自动回收）
     }
-    std::vector<uint8_t> frame = std::move(g_ctx.pending.front());
+    RawFrame frame = std::move(g_ctx.pending.front());
     g_ctx.pending.pop();
-    g_ctx.queuedBytes -= frame.size();
+    g_ctx.queuedBytes -= frame.data.size();
     uint8_t *addr = OH_AVMemory_GetAddr(data);
     int32_t cap = OH_AVMemory_GetSize(data);
-    int32_t len = std::min(static_cast<int32_t>(frame.size()), cap);
-    std::memcpy(addr, frame.data(), len);
+    int32_t len = std::min(static_cast<int32_t>(frame.data.size()), cap);
+    std::memcpy(addr, frame.data.data(), len);
     OH_AVCodecBufferAttr attr;
-    attr.pts = 0;      // buffer 模式 pts 由喂入时序决定，用 0（编码器按输入序输出）
+    attr.pts = frame.pts; // 采集 pts 透传，输出帧 pts 与音频同源可对齐
     attr.size = len;
     attr.offset = 0;
     attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
@@ -78,7 +99,13 @@ void OnNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, void 
 }
 
 void OnNeedOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, OH_AVCodecBufferAttr *attr, void *userData) {
-    if (!attr || !data || !g_ctx.tsfn) {
+    napi_threadsafe_function tsfn;
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.mtx);
+        tsfn = g_ctx.tsfn; // SetFrameCallback 可能并发释放，持锁读取
+    }
+    if (!attr || !data || !tsfn) {
+        OH_VideoEncoder_FreeOutputBuffer(codec, index); // 不消费也必须还 buffer，否则编码器停摆
         return;
     }
     uint8_t *addr = OH_AVMemory_GetAddr(data);
@@ -86,7 +113,7 @@ void OnNeedOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, OH_A
     ev->pts = attr->pts;
     ev->flags = attr->flags;
     ev->data.assign(addr + attr->offset, addr + attr->offset + attr->size);
-    if (napi_call_threadsafe_function(g_ctx.tsfn, ev, napi_tsfn_nonblocking) != napi_ok) {
+    if (napi_call_threadsafe_function(tsfn, ev, napi_tsfn_nonblocking) != napi_ok) {
         delete ev; // 队列满：丢帧防内存膨胀
     }
     OH_VideoEncoder_FreeOutputBuffer(codec, index);
@@ -117,6 +144,30 @@ OH_AVCodec *CreateVideoEncoderByMime(const char *mime) {
     return codec;
 }
 
+// 停掉并销毁视频编码器（Stop/Destroy 可能等回调线程，不能持 g_ctx.mtx 调用，否则与回调死锁）
+void StopVideoInternal() {
+    OH_AVCodec *codec = nullptr;
+    OHNativeWindow *window = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.mtx);
+        g_ctx.running = false;
+        codec = g_ctx.codec;
+        g_ctx.codec = nullptr;
+        window = g_ctx.window;
+        g_ctx.window = nullptr;
+        g_ctx.surfaceMode = false;
+        g_ctx.pending = std::queue<RawFrame>();
+        g_ctx.queuedBytes = 0;
+    }
+    if (codec) {
+        OH_VideoEncoder_Stop(codec);
+        OH_VideoEncoder_Destroy(codec);
+    }
+    if (window) {
+        OH_NativeWindow_DestroyNativeWindow(window);
+    }
+}
+
 // ---- NAPI 接口 ----
 
 napi_value CreateEncoder(napi_env env, napi_callback_info info) {
@@ -137,8 +188,14 @@ napi_value CreateEncoder(napi_env env, napi_callback_info info) {
     }
 
     std::lock_guard<std::mutex> lock(g_ctx.mtx);
-    g_ctx.pending = std::queue<std::vector<uint8_t>>();
+    g_ctx.pending = std::queue<RawFrame>();
     g_ctx.queuedBytes = 0;
+
+    if (g_ctx.codec) {
+        LOGE("createEncoder called while running, stop the old one first");
+        napi_throw_error(env, nullptr, "编码器已在运行，请先 stopEncoder");
+        return nullptr;
+    }
 
     OH_AVCodec *codec = CreateVideoEncoderByMime(mime);
     if (!codec) {
@@ -205,6 +262,11 @@ napi_value CreateEncoderSurface(napi_env env, napi_callback_info info) {
     }
 
     std::lock_guard<std::mutex> lock(g_ctx.mtx);
+    if (g_ctx.codec) {
+        LOGE("createEncoderSurface called while running, stop the old one first");
+        napi_throw_error(env, nullptr, "编码器已在运行，请先 stopEncoder");
+        return nullptr;
+    }
     OH_AVCodec *codec = CreateVideoEncoderByMime(mime);
     if (!codec) {
         napi_throw_error(env, nullptr, "本设备不支持所选编码格式");
@@ -262,7 +324,7 @@ napi_value CreateEncoderSurface(napi_env env, napi_callback_info info) {
     return out;
 }
 
-// 喂一帧 NV21（ArkTS → 队列）
+// 喂一帧 NV21（ArkTS → 队列，pts 微秒随帧透传给编码器）
 napi_value PushFrame(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value args[2];
@@ -273,21 +335,23 @@ napi_value PushFrame(napi_env env, napi_callback_info info) {
     int64_t pts;
     napi_get_value_int64(env, args[1], &pts);
 
+    napi_value out;
     std::lock_guard<std::mutex> lock(g_ctx.mtx);
     if (!g_ctx.running || !g_ctx.codec) {
-        napi_get_boolean(env, false, nullptr);
-        return nullptr;
+        napi_get_boolean(env, false, &out);
+        return out;
     }
     // 队列按字节限长 64MB（4K 一帧约 12MB），满了丢最旧
     while (!g_ctx.pending.empty() && g_ctx.queuedBytes + len > MAX_QUEUED_BYTES) {
-        g_ctx.queuedBytes -= g_ctx.pending.front().size();
+        g_ctx.queuedBytes -= g_ctx.pending.front().data.size();
         g_ctx.pending.pop();
     }
-    std::vector<uint8_t> frame(len);
-    std::memcpy(frame.data(), data, len);
+    RawFrame frame;
+    frame.data.resize(len);
+    std::memcpy(frame.data.data(), data, len);
+    frame.pts = pts;
     g_ctx.pending.push(std::move(frame));
     g_ctx.queuedBytes += len;
-    napi_value out;
     napi_get_boolean(env, true, &out);
     return out;
 }
@@ -327,17 +391,7 @@ napi_value SetFrameCallback(napi_env env, napi_callback_info info) {
 }
 
 napi_value StopEncoder(napi_env env, napi_callback_info info) {
-    std::lock_guard<std::mutex> lock(g_ctx.mtx);
-    g_ctx.running = false;
-    if (g_ctx.codec) {
-        OH_VideoEncoder_Stop(g_ctx.codec);
-        OH_VideoEncoder_Destroy(g_ctx.codec);
-        g_ctx.codec = nullptr;
-    }
-    g_ctx.window = nullptr;
-    g_ctx.surfaceMode = false;
-    g_ctx.pending = std::queue<std::vector<uint8_t>>();
-    g_ctx.queuedBytes = 0;
+    StopVideoInternal();
     napi_value out;
     napi_get_boolean(env, true, &out);
     return out;
@@ -436,7 +490,13 @@ void OnAudioNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, 
 }
 
 void OnAudioNeedOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, OH_AVCodecBufferAttr *attr, void *userData) {
-    if (!attr || !data || !g_audio.tsfn) {
+    napi_threadsafe_function tsfn;
+    {
+        std::lock_guard<std::mutex> lock(g_audio.mtx);
+        tsfn = g_audio.tsfn;
+    }
+    if (!attr || !data || !tsfn) {
+        OH_AudioCodec_FreeOutputBuffer(codec, index);
         return;
     }
     uint8_t *addr = OH_AVMemory_GetAddr(data);
@@ -444,7 +504,7 @@ void OnAudioNeedOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data,
     ev->pts = attr->pts;
     ev->flags = attr->flags;
     ev->data.assign(addr + attr->offset, addr + attr->offset + attr->size);
-    if (napi_call_threadsafe_function(g_audio.tsfn, ev, napi_tsfn_nonblocking) != napi_ok) {
+    if (napi_call_threadsafe_function(tsfn, ev, napi_tsfn_nonblocking) != napi_ok) {
         delete ev; // 队列满：丢帧防内存膨胀
     }
     OH_AudioCodec_FreeOutputBuffer(codec, index);
@@ -460,6 +520,10 @@ napi_value CreateAudioEncoder(napi_env env, napi_callback_info info) {
     napi_get_value_int32(env, args[2], &bitrate);
 
     std::lock_guard<std::mutex> lock(g_audio.mtx);
+    if (g_audio.codec) {
+        napi_throw_error(env, nullptr, "音频编码器已在运行，请先 stopAudioEncoder");
+        return nullptr;
+    }
     g_audio.pending = std::queue<std::vector<uint8_t>>();
     g_audio.ptsUs = 0;
     g_audio.sampleRate = sampleRate;
@@ -554,14 +618,19 @@ napi_value SetAudioFrameCallback(napi_env env, napi_callback_info info) {
 }
 
 napi_value StopAudioEncoder(napi_env env, napi_callback_info info) {
-    std::lock_guard<std::mutex> lock(g_audio.mtx);
-    g_audio.running = false;
-    if (g_audio.codec) {
-        OH_AudioEncoder_Stop(g_audio.codec);
-        OH_AudioEncoder_Destroy(g_audio.codec);
+    OH_AVCodec *codec = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_audio.mtx);
+        g_audio.running = false;
+        codec = g_audio.codec;
         g_audio.codec = nullptr;
+        g_audio.pending = std::queue<std::vector<uint8_t>>();
     }
-    g_audio.pending = std::queue<std::vector<uint8_t>>();
+    // Stop/Destroy 在锁外执行，避免与编码器回调线程死锁
+    if (codec) {
+        OH_AudioEncoder_Stop(codec);
+        OH_AudioEncoder_Destroy(codec);
+    }
     napi_value out;
     napi_get_boolean(env, true, &out);
     return out;

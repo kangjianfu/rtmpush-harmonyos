@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 Shichuangyun (Beijing) Technology Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // common/RtmpClient.ets — 纯 ArkTS 实现的 RTMP 推流客户端（自研，无第三方 SDK）
 // 覆盖：simple/digest(FP9) 握手、AMF0 编码、connect/createStream/publish、
 //       Chunk 协议（format0 + 扩展时间戳 + 分块）、AVCC 视频标签、@setDataFrame 元数据
@@ -6,8 +22,15 @@ import { socket } from '@kit.NetworkKit';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { util } from '@kit.ArkTS';
 
-const FP9_SERVER_KEY = 'Genuine Adobe Flash Media Server 001'; // C1 签名
-const FP9_CLIENT_KEY = 'Genuine Adobe Flash Player 001';       // S1 校验
+// FP9 digest 握手密钥（与 librtmp handshake.h 一致）：
+// - C1/S1 的 digest 用 30/36 字节字符串部分做 HMAC key
+// - C2 的签名用完整密钥（字符串 + 32 字节后缀，FP 62 字节 / FMS 68 字节）
+const FP9_SERVER_KEY = 'Genuine Adobe Flash Media Server 001'; // S1 校验
+const FP9_CLIENT_KEY = 'Genuine Adobe Flash Player 001';       // C1 签名、C2 响应
+const FP9_KEY_SUFFIX: number[] = [
+  0xf0, 0xee, 0xc2, 0x4a, 0x80, 0x68, 0xbe, 0xe8, 0x2e, 0x00, 0xd0, 0xd1, 0x02, 0x9e, 0x7e, 0x57,
+  0x6e, 0xec, 0x5d, 0x2d, 0x29, 0x80, 0x6f, 0xab, 0x93, 0xb8, 0xe6, 0x36, 0xcf, 0xeb, 0x31, 0xae
+];
 const RTMP_HANDSHAKE_SIZE = 1536;
 
 export interface RtmpUrlInfo {
@@ -144,6 +167,36 @@ async function hmacSha256(key: Uint8Array, data: Uint8Array): Promise<Uint8Array
   return res.data;
 }
 
+function fp9Key(s: string, withSuffix: boolean): Uint8Array {
+  const head = new util.TextEncoder().encodeInto(s);
+  if (!withSuffix) {
+    return head;
+  }
+  const out = new Uint8Array(head.length + FP9_KEY_SUFFIX.length);
+  out.set(head);
+  out.set(new Uint8Array(FP9_KEY_SUFFIX), head.length);
+  return out;
+}
+
+// librtmp CalculateDigest：HMAC-SHA256(key, 握手包中除 digest 外的 1536-32 字节)
+async function fp9Digest(sig: Uint8Array, digestPos: number, key: Uint8Array): Promise<Uint8Array> {
+  const mac: cryptoFramework.Mac = cryptoFramework.createMac('SHA256');
+  const symKey: cryptoFramework.SymKey = cryptoFramework.createSymKeyGenerator('HMAC').convertKeySync({ data: key });
+  mac.initSync(symKey);
+  mac.updateSync({ data: sig.subarray(0, digestPos) });
+  mac.updateSync({ data: sig.subarray(digestPos + 32) });
+  return mac.doFinalSync().data;
+}
+
+// librtmp GetDigestOffset1/2：digest 偏移 = 4 字节求和 % 728 + 基址（12 或 776）
+function digestOffset1(sig: Uint8Array): number {
+  return (sig[8] + sig[9] + sig[10] + sig[11]) % 728 + 12;
+}
+
+function digestOffset2(sig: Uint8Array): number {
+  return (sig[772] + sig[773] + sig[774] + sig[775]) % 728 + 776;
+}
+
 function randomBytes(n: number): Uint8Array {
   const b = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
@@ -170,6 +223,36 @@ function amfNumber(w: BufWriter, v: number): void {
 function amfBool(w: BufWriter, v: boolean): void {
   w.u8(0x01);
   w.u8(v ? 1 : 0);
+}
+
+/** annex-b 拆 NAL：兼容 00 00 00 01 与 00 00 01 两种起始码 */
+export function splitAnnexB(data: Uint8Array): Uint8Array[] {
+  const nals: Uint8Array[] = [];
+  const n = data.length;
+  let start = -1;
+  let i = 0;
+  while (i + 2 < n) {
+    if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) {
+      if (start >= 0) {
+        // 剥掉上一 NAL 末尾的起始码前导零
+        let end = i;
+        while (end > start && data[end - 1] === 0) {
+          end--;
+        }
+        if (end > start) {
+          nals.push(data.subarray(start, end));
+        }
+      }
+      start = i + 3;
+      i += 3;
+    } else {
+      i++;
+    }
+  }
+  if (start >= 0 && start < n) {
+    nals.push(data.subarray(start));
+  }
+  return nals;
 }
 
 // AMF0 对象/数组的 key：仅长度+UTF-8，无类型字节（与 amfStr 不同！）
@@ -213,14 +296,11 @@ interface ChunkMsg {
   extended: boolean;
 }
 
-interface DigestLoc {
-  offset: number;
-}
-
 export class RtmpClient {
   onLog: RtmpLog = () => {};
   onReady: () => void = () => {}; // publish 成功后可开始推流
   onClosed: () => void = () => {}; // 连接意外断开（正常 close() 不触发），供上层做重连
+  onError: (msg: string) => void = () => {}; // 协议层错误（publish 被拒、_error 等）
 
   private tcp: socket.TCPSocket = socket.constructTCPSocketInstance();
   private info: RtmpUrlInfo | null = null;
@@ -237,6 +317,11 @@ export class RtmpClient {
   private audioSampleRate: number = 0;
   private audioChannels: number = 0;
   private hevc: boolean = false; // H.265 走 Enhanced RTMP（hvc1），H.264 走老 FLV tag
+  private videoBaseTs: number = -1; // 首帧媒体 ts，音/视频各自归零对齐到推流起点
+  private audioBaseTs: number = -1;
+  private winAckSize: number = 2500000; // 对端 Window Acknowledgement Size（常见默认值）
+  private totalBytesIn: number = 0;
+  private bytesInSinceAck: number = 0;
 
   /** 有音频时先告知（影响 onMetaData 的 audiocodecid 与 AAC 序列头） */
   setAudioInfo(sampleRate: number, channels: number): void {
@@ -250,30 +335,55 @@ export class RtmpClient {
   }
 
   async connect(url: string): Promise<void> {
+    // 支持同一实例重连：关掉旧 socket、重建并复位全部协议状态
+    try {
+      this.tcp.close();
+    } catch (e) { /* 旧连接可能已断开，忽略 */ }
+    const tcp = socket.constructTCPSocketInstance();
+    this.tcp = tcp;
+    this.closing = false;
+    this.handshaking = true;
+    this.ready = false;
+    this.recvBuf = new Uint8Array(0);
+    this.selfChunks.clear();
+    this.chunkSizeIn = 128;
+    this.chunkSizeOut = 128;
+    this.streamId = 0;
+    this.awaiting = '';
+    this.sendStats = [];
+    this.sendQueue = Promise.resolve();
+    this.videoBaseTs = -1;
+    this.audioBaseTs = -1;
+    this.totalBytesIn = 0;
+    this.bytesInSinceAck = 0;
+
     this.info = parseRtmpUrl(url);
     this.onLog(`连接 ${this.info.host}:${this.info.port}`);
-    await this.tcp.connect({
+    await tcp.connect({
       address: { address: this.info.host, port: this.info.port },
       timeout: 10000
     });
-    this.tcp.on('message', (data: socket.SocketMessageInfo) => {
+    tcp.on('message', (data: socket.SocketMessageInfo) => {
       if (data.message) {
         this.onData(new Uint8Array(data.message));
       }
     });
-    this.tcp.on('close', () => {
-      if (!this.closing) {
-        this.ready = false;
-        this.onLog('连接已断开');
-        this.onClosed();
+    tcp.on('close', () => {
+      // 旧 socket 的迟到事件不影响新连接
+      if (this.tcp !== tcp || this.closing) {
+        return;
       }
+      this.ready = false;
+      this.onLog('连接已断开');
+      this.onClosed();
     });
-    this.tcp.on('error', () => {
-      if (!this.closing) {
-        this.ready = false;
-        this.onLog('连接错误');
-        this.onClosed();
+    tcp.on('error', (err) => {
+      if (this.tcp !== tcp || this.closing) {
+        return;
       }
+      this.ready = false;
+      this.onLog(`连接错误 ${JSON.stringify(err)}`);
+      this.onClosed();
     });
     await this.doHandshake();
     await this.sendConnect();
@@ -346,7 +456,8 @@ export class RtmpClient {
         sid = b[off + 7] | (b[off + 8] << 8) | (b[off + 9] << 16) | (b[off + 10] << 24);
       }
       let extBytes = 0;
-      if (extended && fmt <= 2) {
+      if (extended) {
+        // 扩展时间戳消息的所有 chunk（含 fmt=3 续块）都带 4 字节扩展时间戳
         extBytes = 4;
         if (this.recvBuf.length < off + headerLen + 4) {
           return;
@@ -383,6 +494,15 @@ export class RtmpClient {
       return;
     }
     this.pushReceived(data);
+    // 按对端要求的窗口回 ACK，避免严格服务器暂停发送
+    this.totalBytesIn += data.length;
+    this.bytesInSinceAck += data.length;
+    if (!this.handshaking && this.bytesInSinceAck >= this.winAckSize) {
+      this.bytesInSinceAck = 0;
+      const w = new BufWriter();
+      w.u32be(this.totalBytesIn >>> 0);
+      this.sendMessage(2, MSG_ACK, 0, w.build());
+    }
     if (!this.handshaking) {
       this.tryParse();
     }
@@ -397,7 +517,26 @@ export class RtmpClient {
       }
       return;
     }
-    if (msg.type === MSG_WINDOW_ACK || msg.type === MSG_SET_PEER_BW || msg.type === MSG_USER_CONTROL || msg.type === MSG_ACK) {
+    if (msg.type === MSG_WINDOW_ACK) {
+      if (msg.buf.length >= 4) {
+        this.winAckSize = new DataView(msg.buf.buffer).getUint32(0, false);
+      }
+      return;
+    }
+    if (msg.type === MSG_USER_CONTROL) {
+      // PingRequest(6) → PongResponse(7)，不回的话部分服务器会按超时断流
+      if (msg.buf.length >= 6) {
+        const dv = new DataView(msg.buf.buffer);
+        if (dv.getUint16(0, false) === 6) {
+          const w = new BufWriter();
+          w.u16be(7);
+          w.bytes(msg.buf.subarray(2, 6));
+          this.sendMessage(2, MSG_USER_CONTROL, 0, w.build());
+        }
+      }
+      return;
+    }
+    if (msg.type === MSG_SET_PEER_BW || msg.type === MSG_ACK) {
       return;
     }
     if (msg.type === MSG_AMF0_COMMAND) {
@@ -426,10 +565,14 @@ export class RtmpClient {
         this.streamId = sid;
         this.sendPublish();
       }
+    } else if (name === '_error') {
+      this.onLog(`服务器返回 _error（awaiting=${this.awaiting || '无'}）`);
+      this.awaiting = '';
+      this.onError('RTMP 命令被服务器拒绝');
     } else if (name === 'onStatus') {
       // 解析 NetStream.Publish.Start
       const text = dec.decodeToString(buf);
-      if (text.includes('Publish.Start') || text.includes('NetStream.Publish')) {
+      if (text.includes('Publish.Start')) {
         if (!this.ready) {
           this.ready = true;
           this.baseSendTime = Date.now();
@@ -437,8 +580,22 @@ export class RtmpClient {
           this.onLog('推流通道就绪');
           this.onReady();
         }
+      } else if (text.includes('NetStream.Publish') || text.includes('NetConnection.Connect.Failed')
+        || text.includes('NetConnection.Connect.Rejected')) {
+        // Publish.BadName / Publish.Denied / Connect.Failed 等
+        this.ready = false;
+        const detail = this.extractOnStatusCode(buf);
+        this.onLog(`onStatus: ${detail}`);
+        this.onError(`推流被服务器拒绝：${detail}`);
       }
     }
+  }
+
+  /** 从 onStatus 的 AMF0 字节里提取 code 字符串（尽力而为，用于日志和错误上报） */
+  private extractOnStatusCode(buf: Uint8Array): string {
+    const text = new util.TextDecoder('utf-8').decodeToString(buf);
+    const m = text.match(/Net(?:Stream|Connection)\.[A-Za-z.]+/);
+    return m ? m[0] : '未知错误';
   }
 
   private findStreamId(buf: Uint8Array): number {
@@ -461,33 +618,48 @@ export class RtmpClient {
   // ---------------- 握手 ----------------
 
   private async doHandshake(): Promise<void> {
+    // C1：版本 10.0.45.2 声明支持 FP9（librtmp 行为），并自带 digest；
+    // 服务器若不支持 digest，S1 版本字节为 0，走 simple 握手
     const c1 = randomBytes(RTMP_HANDSHAKE_SIZE);
-    const c0c1 = new BufWriter().u8(3).bytes(c1).build();
-    await this.sendRaw(c0c1);
+    new DataView(c1.buffer).setUint32(0, (Date.now() / 1000) & 0x7fffffff, false);
+    c1[4] = 10;
+    c1[5] = 0;
+    c1[6] = 45;
+    c1[7] = 2;
+    const c1DigestPos = digestOffset1(c1);
+    c1.set(await fp9Digest(c1, c1DigestPos, fp9Key(FP9_CLIENT_KEY, false)), c1DigestPos);
+    await this.sendRaw(new BufWriter().u8(3).bytes(c1).build());
+
     // 等 S0S1S2（至少 3073 字节）
     const resp = await this.waitBytes(3073, 10000);
     // S0 = resp[0]; S1 = resp[1..1537]; S2 = resp[1537..3073]
     const s1 = resp.subarray(1, 1 + RTMP_HANDSHAKE_SIZE);
-    const digestInfo = this.findDigestOffset(s1);
-    if (digestInfo.offset >= 0) {
-      this.onLog('服务器要求 digest 握手');
-      // 校验 S1 digest（用 client key）
-      const s1Copy = new Uint8Array(s1);
-      s1Copy.set(new Uint8Array(32), digestInfo.offset);
-      const expect = await hmacSha256(new util.TextEncoder().encodeInto(FP9_CLIENT_KEY), s1Copy);
-      const actual = s1.subarray(digestInfo.offset, digestInfo.offset + 32);
-      if (!this.bytesEqual(expect, actual)) {
-        this.onLog('S1 digest 校验失败（继续，部分服务器不校验）');
+
+    // 校验 S1 digest（key 为 FMS key 的 36 字节字符串部分），两种 scheme 各试一次
+    let digestPos = -1;
+    if (s1[4] !== 0) {
+      const fmsKey = fp9Key(FP9_SERVER_KEY, false);
+      for (const pos of [digestOffset1(s1), digestOffset2(s1)]) {
+        const expect = await fp9Digest(s1, pos, fmsKey);
+        if (this.bytesEqual(expect, s1.subarray(pos, pos + 32))) {
+          digestPos = pos;
+          break;
+        }
       }
-      // C2 = digest(S1 原样) 放入 random 区，结构：time(4)+time2(4)+random(1508)+digest(32)
-      const timeDv = new DataView(s1.buffer);
-      const s1time = timeDv.getUint32(0, false);
-      const now = (Date.now() / 1000) & 0x7fffffff;
-      const c2Random = randomBytes(1508);
-      const c2head = new BufWriter().u32be(s1time).u32be(now).bytes(c2Random).build();
-      const c2digest = await hmacSha256(new util.TextEncoder().encodeInto(FP9_SERVER_KEY), c2head);
-      await this.sendRaw(new BufWriter().bytes(c2head).bytes(c2digest).build());
+    }
+
+    if (digestPos >= 0) {
+      this.onLog('服务器要求 digest 握手');
+      // C2（1536 字节）：末尾 32 字节 = HMAC(key=HMAC(key=FP62, S1 digest), data=C2 前 1504 字节)
+      const c2 = randomBytes(RTMP_HANDSHAKE_SIZE);
+      const digestResp = await hmacSha256(fp9Key(FP9_CLIENT_KEY, true), s1.subarray(digestPos, digestPos + 32));
+      const sig = await hmacSha256(digestResp, c2.subarray(0, RTMP_HANDSHAKE_SIZE - 32));
+      c2.set(sig, RTMP_HANDSHAKE_SIZE - 32);
+      await this.sendRaw(c2);
     } else {
+      if (s1[4] !== 0) {
+        this.onLog('S1 digest 校验失败，按 simple 握手继续');
+      }
       // simple 握手：C2 原样回 S1
       await this.sendRaw(s1);
     }
@@ -496,18 +668,6 @@ export class RtmpClient {
     this.baseSendTime = Date.now();
     // 握手响应里可能已附带控制消息
     this.tryParse();
-  }
-
-  private findDigestOffset(s1: Uint8Array): DigestLoc {
-    // FP9：digest offset 存放在 1536-8 的两组四字节（772/776），均为 little-endian
-    const dv = new DataView(s1.buffer);
-    const scheme0 = dv.getUint32(772, true) % 764;
-    const scheme1 = dv.getUint32(776, true) % 764;
-    const offset = 8 + (scheme0 <= scheme1 ? scheme0 : scheme1 + 764);
-    if (offset >= 0 && offset + 32 <= RTMP_HANDSHAKE_SIZE) {
-      return { offset: offset };
-    }
-    return { offset: -1 };
   }
 
   private bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -536,6 +696,13 @@ export class RtmpClient {
     amfBool(w, false);
     amfKey(w, 'capabilities');
     amfNumber(w, 15);
+    if (this.hevc) {
+      // Enhanced RTMP：声明支持 hvc1 FourCC（规范要求，部分服务器据此放行 H.265）
+      amfKey(w, 'fourCcList');
+      w.u8(0x0a); // strict array
+      w.u32be(1);
+      amfStr(w, 'hvc1');
+    }
     w.u16be(0);
     w.u8(0x09); // object end
     await this.sendMessage(3, MSG_AMF0_COMMAND, 0, w.build());
@@ -586,7 +753,7 @@ export class RtmpClient {
     body.u8(1); // numOfPPS
     body.u16be(pps.length);
     body.bytes(pps);
-    await this.sendMessage(4, MSG_VIDEO, this.streamId, body.build());
+    await this.sendMessage(4, MSG_VIDEO, this.streamId, body.build(), 0);
     this.onLog('已发送 SPS/PPS');
 
     await this.sendMeta(width, height, frameRate);
@@ -607,7 +774,8 @@ export class RtmpClient {
     amfKey(meta, 'framerate');
     amfNumber(meta, frameRate);
     amfKey(meta, 'videocodecid');
-    amfNumber(meta, this.hevc ? 12 : 7);
+    // Enhanced RTMP：HEVC 用 FourCC 'hvc1' 的数值（0x68766331），AVC 保持 7
+    amfNumber(meta, this.hevc ? 0x68766331 : 7);
     amfKey(meta, 'audiocodecid');
     amfNumber(meta, hasAudio ? 10 : 0);
     if (hasAudio) {
@@ -618,7 +786,7 @@ export class RtmpClient {
     }
     meta.u16be(0);
     meta.u8(0x09);
-    await this.sendMessage(4, MSG_AMF0_META, this.streamId, meta.build());
+    await this.sendMessage(4, MSG_AMF0_META, this.streamId, meta.build(), 0);
   }
 
   /** 发送 AAC 序列头（AudioSpecificConfig，profile=LC）。须先于音频帧发送 */
@@ -636,46 +804,32 @@ export class RtmpClient {
     body.u8(0xaf); // soundFormat=10(AAC) | rate=3(44k) | size=1(16bit) | type=1(stereo 占位，实际声道以 ASC 为准)
     body.u8(0x00); // AAC sequence header
     body.u16be(asc);
-    await this.sendMessage(5, MSG_AUDIO, this.streamId, body.build());
+    await this.sendMessage(5, MSG_AUDIO, this.streamId, body.build(), 0);
     this.onLog('已发送 AAC 序列头');
   }
 
-  /** 发送一帧 AAC（raw，无 ADTS） */
-  async sendAudioFrame(aac: Uint8Array): Promise<void> {
+  /** 发送一帧 AAC（raw，无 ADTS），pts 毫秒（缺省按发送时刻） */
+  async sendAudioFrame(aac: Uint8Array, ptsMs?: number): Promise<void> {
     const body = new BufWriter();
     body.u8(0xaf);
     body.u8(0x01); // AAC raw
     body.bytes(aac);
-    await this.sendMessage(5, MSG_AUDIO, this.streamId, body.build());
+    await this.sendMessage(5, MSG_AUDIO, this.streamId, body.build(), this.normTs(ptsMs, false));
   }
 
-  /** 发送一帧 H.264/H.265（annex-b），isKey 关键帧，dts 毫秒 */
-  async sendVideoFrame(annexb: Uint8Array, isKey: boolean, dts: number): Promise<void> {
+  /** 发送一帧 H.264/H.265（annex-b），isKey 关键帧，dts 毫秒（缺省按发送时刻） */
+  async sendVideoFrame(annexb: Uint8Array, isKey: boolean, dts?: number): Promise<void> {
     // annex-b → AVCC（长度前缀）
-    const nals: Uint8Array[] = [];
-    let start = -1;
-    for (let i = 0; i + 3 < annexb.length; i++) {
-      if (annexb[i] === 0 && annexb[i + 1] === 0 && annexb[i + 2] === 0 && annexb[i + 3] === 1) {
-        if (start >= 0) {
-          nals.push(annexb.subarray(start, i));
-        }
-        start = i + 4;
-        i += 3;
-      }
-    }
-    if (start >= 0) {
-      nals.push(annexb.subarray(start));
-    }
+    const nals = splitAnnexB(annexb);
     if (nals.length === 0) {
       return;
     }
     const body = new BufWriter();
     if (this.hevc) {
-      // Enhanced RTMP v2：FrameType|ExHeader|PacketType(CodedFrames) + fourcc 'hvc1'
-      body.u8(((isKey ? 1 : 2) << 4) | 0x08);
-      body.u8(0x80); // PacketType=1 (CodedFrames) 的低位
+      // Enhanced RTMP：FrameType(高4位) | 0x08(ExHeader 标志) | PacketType(低3位)，单字节
+      body.u8(((isKey ? 1 : 2) << 4) | 0x08 | 0x01); // PacketType=1 CodedFrames
       body.bytes([0x68, 0x76, 0x63, 0x31]); // 'hvc1'
-      body.u24be(0); // composition time
+      body.u24be(0); // composition time offset（无 B 帧恒为 0）
     } else {
       body.u8(((isKey ? 1 : 2) << 4) | 7);
       body.u8(0x01); // NALU
@@ -685,7 +839,7 @@ export class RtmpClient {
       body.u32be(nal.length);
       body.bytes(nal);
     }
-    await this.sendMessage(4, MSG_VIDEO, this.streamId, body.build());
+    await this.sendMessage(4, MSG_VIDEO, this.streamId, body.build(), this.normTs(dts, true));
   }
 
   /** 发送 H.265 序列头（VPS/SPS/PPS → hvcC，Enhanced RTMP PacketType=0） */
@@ -719,11 +873,10 @@ export class RtmpClient {
       hvcc.bytes(nalData[i]);
     }
     const body = new BufWriter();
-    body.u8(0x18); // FrameType=1 | ExHeader | PacketType=0(SequenceStart) 高位
-    body.u8(0x00); // PacketType 低位
+    body.u8(0x18); // FrameType=1(关键帧) | ExHeader(0x08) | PacketType=0(SequenceStart)，单字节
     body.bytes([0x68, 0x76, 0x63, 0x31]); // 'hvc1'
     body.bytes(hvcc.build());
-    await this.sendMessage(4, MSG_VIDEO, this.streamId, body.build());
+    await this.sendMessage(4, MSG_VIDEO, this.streamId, body.build(), 0);
     this.onLog('已发送 VPS/SPS/PPS（hvcC）');
 
     // onMetaData 与 AVC 共用
@@ -732,6 +885,23 @@ export class RtmpClient {
 
   // ---------------- 底层发送 ----------------
 
+  /** 媒体时间戳归一化：音/视频各自以首帧为 0（缺省退化为发送时刻） */
+  private normTs(ptsMs: number | undefined, isVideo: boolean): number {
+    if (ptsMs === undefined || !isFinite(ptsMs)) {
+      return Date.now() - this.baseSendTime;
+    }
+    if (isVideo) {
+      if (this.videoBaseTs < 0) {
+        this.videoBaseTs = ptsMs;
+      }
+      return Math.max(0, Math.round(ptsMs - this.videoBaseTs));
+    }
+    if (this.audioBaseTs < 0) {
+      this.audioBaseTs = ptsMs;
+    }
+    return Math.max(0, Math.round(ptsMs - this.audioBaseTs));
+  }
+
   private async sendSetChunkSize(size: number): Promise<void> {
     const w = new BufWriter();
     w.u32be(size);
@@ -739,9 +909,9 @@ export class RtmpClient {
     this.chunkSizeOut = size;
   }
 
-  private async sendMessage(csid: number, type: number, streamId: number, body: Uint8Array): Promise<void> {
+  private async sendMessage(csid: number, type: number, streamId: number, body: Uint8Array, tsMs?: number): Promise<void> {
     const w = new BufWriter();
-    const ts = Date.now() - this.baseSendTime;
+    const ts = tsMs ?? (Date.now() - this.baseSendTime);
     const fmt0Header = new BufWriter();
     fmt0Header.u8(csid & 0x3f); // fmt=0, csid<63
     if (ts >= 0xffffff) {
@@ -832,6 +1002,7 @@ export class RtmpClient {
 
   async close(): Promise<void> {
     this.closing = true;
+    this.ready = false;
     try {
       await this.tcp.close();
     } catch (e) { /* 忽略 */ }

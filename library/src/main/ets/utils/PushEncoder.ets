@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 Shichuangyun (Beijing) Technology Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // PushEncoder.ets — native 编码器的 ArkTS 封装（libpush_encoder.so）
 // 视频：NV21 帧 → H.264/H.265 硬编；音频：PCM S16LE → AAC 硬编。均为 buffer 模式异步回调。
 import pushEncoder from 'libpush_encoder.so';
@@ -59,7 +75,7 @@ export class PushEncoder {
     }
   }
 
-  /** 创建并启动视频编码器（buffer 模式，喂 NV21）。失败抛异常（设备不支持该格式等） */
+  /** 创建并启动视频编码器（buffer 模式，喂 NV21）。失败抛异常（设备不支持该格式、编码器已在运行等） */
   createVideo(width: number, height: number, fps: number, bitrateKbps: number,
     iFrameIntervalMs: number = 2000, codec: VideoCodec = 'video/avc'): void {
     native.createEncoder(width, height, fps, bitrateKbps * 1000, iFrameIntervalMs, codec);
