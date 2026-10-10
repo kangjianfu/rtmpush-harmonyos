@@ -86,6 +86,8 @@ H.265 推流：`createVideo(..., 'video/hevc')`，config 帧里抽 VPS(32)/SPS(3
 
 自适应码流：用 `rtmp.getSendRateKbps()` 拿最近 3 秒实测上行速率，低于目标码流时调 `encoder.setVideoBitrate(kbps)` 动态降码率（参考实现见体云赛事 App 的 LivePush 页）。
 
+断线重连：挂 `rtmp.onClosed` 回调，断开后新建 `RtmpClient` 实例重连（相机/编码器不用停），重连成功后记得重发视频/音频序列头（新通道没有对端状态）。建议指数退避（1s 起、30s 封顶）。
+
 ## 权限
 
 ```json5
