@@ -16,6 +16,7 @@ export type VideoCodec = 'video/avc' | 'video/hevc';
 
 interface NativeModule {
   createEncoder(width: number, height: number, fps: number, bitrate: number, iIntervalMs: number, mime?: string): boolean;
+  createEncoderSurface(width: number, height: number, fps: number, bitrate: number, iIntervalMs: number, mime?: string): string;
   pushFrame(data: ArrayBufferLike, ptsUs: number): boolean;
   setFrameCallback(cb: (data: ArrayBuffer, ptsUs: number, flags: number) => void): boolean;
   stopEncoder(): boolean;
@@ -58,13 +59,23 @@ export class PushEncoder {
     }
   }
 
-  /** 创建并启动视频编码器。失败抛异常（设备不支持该格式等） */
+  /** 创建并启动视频编码器（buffer 模式，喂 NV21）。失败抛异常（设备不支持该格式等） */
   createVideo(width: number, height: number, fps: number, bitrateKbps: number,
     iFrameIntervalMs: number = 2000, codec: VideoCodec = 'video/avc'): void {
     native.createEncoder(width, height, fps, bitrateKbps * 1000, iFrameIntervalMs, codec);
   }
 
-  /** 喂一帧 NV21（Y 平面 + VU 交错平面拼接） */
+  /**
+   * 创建并启动视频编码器（surface 零拷贝模式）。
+   * 返回编码器输入 surfaceId，直接交给相机 PreviewOutput，画面直通编码器、无内存拷贝。
+   * 失败抛异常（调用方应回退 buffer 模式）。
+   */
+  createVideoSurface(width: number, height: number, fps: number, bitrateKbps: number,
+    iFrameIntervalMs: number = 2000, codec: VideoCodec = 'video/avc'): string {
+    return native.createEncoderSurface(width, height, fps, bitrateKbps * 1000, iFrameIntervalMs, codec);
+  }
+
+  /** 喂一帧 NV21（Y 平面 + VU 交错平面拼接）。surface 模式下不应调用 */
   pushVideoFrame(nv21: ArrayBufferLike, ptsUs: number): boolean {
     return native.pushFrame(nv21, ptsUs);
   }

@@ -1,6 +1,7 @@
-// push_encoder.cpp — 原生 H.264 编码器（buffer 模式），NAPI 桥接到 ArkTS
-// 管线：ArkTS ImageReceiver 拿 NV21 帧 → pushFrame 入队 → 编码器 onNeedInputData 消费
-//       → onNeedOutputData 拿到 H.264 → tsfn 回调 ArkTS onFrame(bytes, flags, pts)
+// push_encoder.cpp — 原生 H.264/H.265 编码器，NAPI 桥接到 ArkTS
+// buffer 模式：ArkTS ImageReceiver 拿 NV21 帧 → pushFrame 入队 → onNeedInputData 消费
+// surface 模式（零拷贝）：相机画面直通编码器 surface，无内存拷贝；CreateEncoderSurface 返回 surfaceId
+// 输出统一：onNeedOutputData 拿到 H.264/H.265 → tsfn 回调 ArkTS onFrame(bytes, flags, pts)
 #include <napi/native_api.h>
 #include <multimedia/player_framework/native_avcodec_videoencoder.h>
 #include <multimedia/player_framework/native_avcodec_audioencoder.h>
@@ -11,10 +12,12 @@
 #include <multimedia/player_framework/native_avbuffer.h>
 #include <multimedia/player_framework/native_avmemory.h>
 #include <multimedia/player_framework/avcodec_audio_channel_layout.h>
+#include <native_window/external_window.h>
 #include <hilog/log.h>
 #include <cstring>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <vector>
 
 #define LOG_TAG "PushEncoder"
@@ -26,9 +29,11 @@ namespace {
 struct EncoderCtx {
     OH_AVCodec *codec = nullptr;
     napi_threadsafe_function tsfn = nullptr;
-    std::queue<std::vector<uint8_t>> pending;   // 待编码 NV21 帧
+    std::queue<std::vector<uint8_t>> pending;   // 待编码 NV21 帧（buffer 模式）
     std::mutex mtx;
     bool running = false;
+    bool surfaceMode = false;                   // surface 零拷贝模式（相机直通）
+    OHNativeWindow *window = nullptr;
     size_t queuedBytes = 0;                     // 队列总字节数（4K 一帧 12MB，按字节限长）
 };
 
@@ -181,6 +186,82 @@ napi_value CreateEncoder(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// surface 零拷贝模式：相机直通编码器，返回编码器输入 surface 的 id（供相机 PreviewOutput 用）
+// 顺序：Create → SetCallback → Configure → GetSurface → Prepare → Start
+napi_value CreateEncoderSurface(napi_env env, napi_callback_info info) {
+    size_t argc = 6;
+    napi_value args[6];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t width, height, fps, bitrate, iInterval;
+    napi_get_value_int32(env, args[0], &width);
+    napi_get_value_int32(env, args[1], &height);
+    napi_get_value_int32(env, args[2], &fps);
+    napi_get_value_int32(env, args[3], &bitrate);
+    napi_get_value_int32(env, args[4], &iInterval);
+    char mime[32] = "video/avc";
+    if (argc >= 6) {
+        size_t len = 0;
+        napi_get_value_string_utf8(env, args[5], mime, sizeof(mime), &len);
+    }
+
+    std::lock_guard<std::mutex> lock(g_ctx.mtx);
+    OH_AVCodec *codec = CreateVideoEncoderByMime(mime);
+    if (!codec) {
+        napi_throw_error(env, nullptr, "本设备不支持所选编码格式");
+        return nullptr;
+    }
+    OH_AVFormat *format = OH_AVFormat_CreateVideoFormat(mime, width, height);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_BITRATE, bitrate);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_FRAME_RATE, fps);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_I_FRAME_INTERVAL, iInterval);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_VIDEO_ENCODE_BITRATE_MODE, BITRATE_MODE_VBR);
+
+    OH_AVCodecAsyncCallback cb = { OnError, OnStreamChanged, OnNeedInputData, OnNeedOutputData };
+    OH_VideoEncoder_SetCallback(codec, cb, nullptr);
+    OH_AVErrCode ret = OH_VideoEncoder_Configure(codec, format);
+    OH_AVFormat_Destroy(format);
+    if (ret != AV_ERR_OK) {
+        LOGE("surface configure failed %{public}d", ret);
+        OH_VideoEncoder_Destroy(codec);
+        napi_throw_error(env, nullptr, "configure failed");
+        return nullptr;
+    }
+    OHNativeWindow *window = nullptr;
+    ret = OH_VideoEncoder_GetSurface(codec, &window);
+    if (ret != AV_ERR_OK || !window) {
+        LOGE("get surface failed %{public}d", ret);
+        OH_VideoEncoder_Destroy(codec);
+        napi_throw_error(env, nullptr, "get surface failed");
+        return nullptr;
+    }
+    uint64_t surfaceId = 0;
+    OH_NativeWindow_GetSurfaceId(window, &surfaceId);
+    ret = OH_VideoEncoder_Prepare(codec);
+    if (ret != AV_ERR_OK) {
+        LOGE("surface prepare failed %{public}d", ret);
+        OH_VideoEncoder_Destroy(codec);
+        napi_throw_error(env, nullptr, "prepare failed");
+        return nullptr;
+    }
+    ret = OH_VideoEncoder_Start(codec);
+    if (ret != AV_ERR_OK) {
+        LOGE("surface start failed %{public}d", ret);
+        OH_VideoEncoder_Destroy(codec);
+        napi_throw_error(env, nullptr, "start failed");
+        return nullptr;
+    }
+    g_ctx.codec = codec;
+    g_ctx.window = window;
+    g_ctx.surfaceMode = true;
+    g_ctx.running = true;
+    LOGI("surface encoder started %{public}dx%{public}d fps=%{public}d sid=%{public}llu",
+         width, height, fps, (unsigned long long)surfaceId);
+
+    napi_value out;
+    napi_create_string_utf8(env, std::to_string(surfaceId).c_str(), NAPI_AUTO_LENGTH, &out);
+    return out;
+}
+
 // 喂一帧 NV21（ArkTS → 队列）
 napi_value PushFrame(napi_env env, napi_callback_info info) {
     size_t argc = 2;
@@ -253,6 +334,8 @@ napi_value StopEncoder(napi_env env, napi_callback_info info) {
         OH_VideoEncoder_Destroy(g_ctx.codec);
         g_ctx.codec = nullptr;
     }
+    g_ctx.window = nullptr;
+    g_ctx.surfaceMode = false;
     g_ctx.pending = std::queue<std::vector<uint8_t>>();
     g_ctx.queuedBytes = 0;
     napi_value out;
@@ -487,6 +570,7 @@ napi_value StopAudioEncoder(napi_env env, napi_callback_info info) {
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {
         { "createEncoder", nullptr, CreateEncoder, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "createEncoderSurface", nullptr, CreateEncoderSurface, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "pushFrame", nullptr, PushFrame, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setFrameCallback", nullptr, SetFrameCallback, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "stopEncoder", nullptr, StopEncoder, nullptr, nullptr, nullptr, napi_default, nullptr },

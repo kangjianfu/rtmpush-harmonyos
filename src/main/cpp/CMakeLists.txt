@@ -11,6 +11,7 @@ find_library(media_aenc_lib native_media_aenc)
 find_library(media_acodec_lib native_media_acodec)
 find_library(media_core_lib native_media_core)
 find_library(media_codecbase_lib native_media_codecbase)
+find_library(native_window_lib native_window)
 find_library(hilog_lib hilog_ndk.z)
 
 target_link_libraries(push_encoder PUBLIC
@@ -20,5 +21,6 @@ target_link_libraries(push_encoder PUBLIC
     ${media_acodec_lib}
     ${media_core_lib}
     ${media_codecbase_lib}
+    ${native_window_lib}
     ${hilog_lib}
 )
