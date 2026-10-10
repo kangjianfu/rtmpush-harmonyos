@@ -222,6 +222,41 @@ struct Index {
     this.starting = false;
   }
 
+  /** 仅测试 RTMP 连接（不启编码器/相机，模拟器可用来验证握手与 publish） */
+  private async testConnect(): Promise<void> {
+    if (this.starting || this.pushing) {
+      return;
+    }
+    if (!this.pushUrl.startsWith('rtmp://')) {
+      promptAction.showToast({ message: '请输入 rtmp:// 开头的推流地址' });
+      return;
+    }
+    this.starting = true;
+    this.statusText = '测试连接…';
+    const oldReady = this.rtmp.onReady;
+    this.rtmp.onReady = () => {
+      this.rtmp.onReady = oldReady; // 一次性包装，避免覆盖正常推流的回调
+      this.addLog('publish 成功，协议链路完整');
+      this.statusText = '连接测试通过';
+    };
+    try {
+      await this.rtmp.connect(this.pushUrl);
+      this.addLog('连接+握手完成，等待 publish 结果…');
+      // 协议链路测完即断开
+      setTimeout(() => {
+        this.rtmp.close();
+        if (this.statusText === '测试连接…') {
+          this.statusText = '已连接（未收到 publish 确认）';
+        }
+      }, 3000);
+    } catch (e) {
+      this.statusText = '连接失败';
+      this.addLog(e instanceof Error ? e.message : String(e));
+      promptAction.showToast({ message: e instanceof Error ? e.message : '连接失败' });
+    }
+    this.starting = false;
+  }
+
   private async startCamera(): Promise<void> {
     const ctx = getContext(this);
     const camManager = camera.getCameraManager(ctx);
@@ -249,7 +284,7 @@ struct Index {
       frameSurfaceId = this.encoderSurfaceId;
     } else {
       const receiver = image.createImageReceiver(this.videoW(), this.videoH(),
-        image.ImageFormat.YCRCB_420_SP, 8); // NV21，与编码器 OH_MD_KEY_PIXEL_FORMAT=3 对应
+        image.ImageFormat.YCBCR_422_SP, 8); // ImageReceiver 仅支持 4:2:2 SP，喂帧前降采样成 NV21
       this.receiver = receiver;
       receiver.on('imageArrival', () => {
         this.onCameraFrame(receiver);
@@ -290,11 +325,17 @@ struct Index {
       const vu = await img.getComponent(image.ComponentType.YUV_V);
       const yBytes = new Uint8Array(y.byteBuffer);
       const vuBytes = new Uint8Array(vu.byteBuffer);
-      const frame = new Uint8Array(yBytes.length + vuBytes.length);
-      frame.set(yBytes);
-      frame.set(vuBytes, yBytes.length);
-      this.encoder.pushVideoFrame(frame.buffer, Date.now() * 1000);
+      // 4:2:2 SP（Y + 全高 VU）→ NV21（Y + 半高 VU）：VU 平面隔行取样
+      const w = this.videoW();
+      const h = this.videoH();
+      const frame = new Uint8Array(w * h * 3 / 2);
+      frame.set(yBytes.subarray(0, w * h));
+      const vuOut = frame.subarray(w * h);
+      for (let r = 0; r < h / 2; r++) {
+        vuOut.set(vuBytes.subarray(r * 2 * w, r * 2 * w + w), r * w);
+      }
       img.release();
+      this.encoder.pushVideoFrame(frame.buffer, Date.now() * 1000);
     } catch (e) { /* 忽略 */ }
   }
 
@@ -482,6 +523,17 @@ struct Index {
           .enabled(!this.pushing)
           .onClick(() => {
             this.pasteUrl();
+          })
+        Button('仅测连接')
+          .height(44)
+          .fontSize(14)
+          .fontColor('#374151')
+          .backgroundColor('#e5e7eb')
+          .borderRadius(12)
+          .layoutWeight(1)
+          .enabled(!this.pushing)
+          .onClick(() => {
+            this.testConnect();
           })
       }
       .width('100%')
