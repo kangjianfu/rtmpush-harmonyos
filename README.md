@@ -71,7 +71,7 @@ H.265 推流：`createVideo(..., 'video/hevc')`，config 帧里抽 VPS(32)/SPS(3
 
 ## 路线图
 
-- **v0.2 Surface 零拷贝编码**：`OH_VideoEncoder_GetSurface` 让相机直通编码器，消灭 NV21 内存拷贝（4K 时每帧省 12MB 拷贝，功耗显著下降）
+- ~~v0.2 Surface 零拷贝编码~~ 已完成：`createVideoSurface()` 返回编码器 surfaceId 交给相机，画面直通编码器零拷贝；失败自动回退 buffer 模式
 - 弱网增强：RTT 探测、丢帧统计上报
 
 ## License
