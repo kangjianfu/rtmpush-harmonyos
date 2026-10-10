@@ -1,0 +1,15 @@
+# HarmonyOS
+oh_modules/
+build/
+.hvigor/
+.cxx/
+local.properties
+*.har
+.hvigorws/
+
+# IDE
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db

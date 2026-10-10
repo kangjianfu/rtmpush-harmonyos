@@ -1,8 +1,9 @@
 {
-  "name": "rtmpush",
+  "name": "rtmpush-project",
   "version": "0.1.0",
-  "description": "鸿蒙原生 RTMP 推流库：纯 ArkTS RTMP 协议栈 + native H.264/H.265 硬编 + AAC 音频，无第三方依赖",
-  "main": "Index.ets",
+  "modelVersion": "6.0.0",
+  "description": "rtmpush 库工程（独立构建 assembleHar）",
+  "main": "",
   "author": "shichuangyun",
   "license": "Apache-2.0",
   "dependencies": {}

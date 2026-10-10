@@ -2,6 +2,30 @@
 
 纯 HarmonyOS 实现的 RTMP 推流 SDK，**无任何第三方依赖**。阿里云 / 腾讯云 / 即构的推流 SDK 均无鸿蒙版本，本库填补这一空白。
 
+## 集成方式
+
+**方式一：ohpm 本地引用**（本仓库 clone 到项目旁）
+
+```json5
+// 你模块的 oh-package.json5
+"dependencies": { "rtmpush": "file:../rtmpush/library" }
+```
+
+**方式二：git submodule**（推荐，版本可锁定）
+
+```bash
+git submodule add https://git.ycan.cn/kangjianfu/rtmpush.git deps/rtmpush
+# oh-package.json5 里："rtmpush": "file:../deps/rtmpush/library"
+```
+
+## 独立构建
+
+```bash
+# DevEco Studio 直接打开本仓库；或命令行：
+hvigorw assembleHar --mode module -p module=library@default -p product=default --no-daemon
+# 产物：library/build/default/outputs/default/library.har
+```
+
 ## 组成
 
 | 模块 | 说明 |

@@ -1,6 +1,6 @@
 {
   "module": {
-    "name": "rtmpush",
+    "name": "library",
     "type": "har",
     "deviceTypes": ["phone", "tablet"]
   }
