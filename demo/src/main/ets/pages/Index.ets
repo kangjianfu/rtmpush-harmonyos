@@ -374,15 +374,25 @@ struct Index {
 
   build() {
     Column({ space: 10 }) {
-      Text('rtmpush Demo')
-        .fontSize(18)
-        .fontWeight(FontWeight.Medium)
-        .width('100%')
-        .margin({ top: 12 })
+      // 头部：品牌名 + 副标题
+      Column({ space: 2 }) {
+        Text('rtmpush')
+          .fontSize(24)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#111827')
+        Text('鸿蒙原生 RTMP 推流库 · 演示')
+          .fontSize(12)
+          .fontColor('#9ca3af')
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .margin({ top: 12, bottom: 2 })
 
       XComponent({ id: 'demo_preview', type: XComponentType.SURFACE, controller: this.xController })
         .width('100%')
         .aspectRatio(16 / 9)
+        .borderRadius(16)
+        .clip(true)
         .backgroundColor(Color.Black)
         .onLoad(() => {
           this.xSurfaceId = this.xController.getXComponentSurfaceId();
@@ -431,6 +441,8 @@ struct Index {
         .width('100%')
         .height(110)
         .fontSize(14)
+        .backgroundColor(Color.White)
+        .borderRadius(16)
         .enabled(!this.pushing)
         .onChange((v: string) => {
           this.pushUrl = v;
@@ -442,7 +454,7 @@ struct Index {
           .fontSize(14)
           .fontColor(Color.White)
           .backgroundColor('#16a34a')
-          .borderRadius(8)
+          .borderRadius(12)
           .layoutWeight(1)
           .enabled(!this.pushing)
           .onClick(() => {
@@ -453,7 +465,7 @@ struct Index {
           .fontSize(14)
           .fontColor('#374151')
           .backgroundColor('#e5e7eb')
-          .borderRadius(8)
+          .borderRadius(12)
           .layoutWeight(1)
           .enabled(!this.pushing)
           .onClick(() => {
@@ -462,7 +474,10 @@ struct Index {
       }
       .width('100%')
 
-      Row({ space: 10 }) {
+      // 状态行：状态点 + 文字 + fps
+      Row({ space: 8 }) {
+        Circle({ width: 8, height: 8 })
+          .fill(this.pushing ? '#dc2626' : '#d1d5db')
         Text(this.statusText)
           .fontSize(13)
           .fontColor(this.pushing ? '#dc2626' : '#6b7280')
@@ -470,21 +485,31 @@ struct Index {
         Text(`${this.fps}fps`)
           .fontSize(12)
           .fontColor(this.pushing ? '#dc2626' : '#9ca3af')
-        Button(this.pushing ? '停止推流' : '开始推流')
-          .height(40)
-          .fontSize(14)
-          .fontColor(Color.White)
-          .backgroundColor(this.pushing ? '#dc2626' : '#0a59f7')
-          .borderRadius(8)
-          .onClick(() => {
-            if (this.pushing) {
-              this.stopAll();
-            } else {
-              this.startPush();
-            }
-          })
       }
       .width('100%')
+      .padding({ left: 4, right: 4 })
+
+      // 主按钮：全宽渐变
+      Button(this.pushing ? '停止推流' : '开始推流')
+        .width('100%')
+        .height(56)
+        .fontSize(18)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Color.White)
+        .borderRadius(16)
+        .linearGradient({
+          angle: 90,
+          colors: this.pushing
+            ? [['#ef4444', 0], ['#b91c1c', 1]]
+            : [['#3b82f6', 0], ['#0a59f7', 1]]
+        })
+        .onClick(() => {
+          if (this.pushing) {
+            this.stopAll();
+          } else {
+            this.startPush();
+          }
+        })
 
       Scroll() {
         Column({ space: 4 }) {
@@ -498,8 +523,9 @@ struct Index {
         .width('100%')
       }
       .layoutWeight(1)
-      .backgroundColor('#f5f5f7')
-      .padding(8)
+      .backgroundColor(Color.White)
+      .borderRadius(16)
+      .padding(10)
     }
     .width('100%')
     .height('100%')
