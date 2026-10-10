@@ -14,7 +14,7 @@
 **方式二：git submodule**（推荐，版本可锁定）
 
 ```bash
-git submodule add https://github.com/<your-org>/rtmpush-harmonyos.git deps/rtmpush-harmonyos
+git submodule add https://github.com/kangjianfu/rtmpush-harmonyos.git deps/rtmpush-harmonyos
 # oh-package.json5 里："rtmpush": "file:../deps/rtmpush-harmonyos/library"
 ```
 
