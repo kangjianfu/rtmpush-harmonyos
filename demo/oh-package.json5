@@ -1,0 +1,11 @@
+{
+  "name": "demo",
+  "version": "0.1.0",
+  "description": "rtmpush 演示 App：输入 RTMP 地址即可推流",
+  "main": "",
+  "author": "shichuangyun",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "rtmpush": "file:../library"
+  }
+}

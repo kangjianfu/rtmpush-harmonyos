@@ -26,6 +26,15 @@ hvigorw assembleHar --mode module -p module=library@default -p product=default -
 # 产物：library/build/default/outputs/default/library.har
 ```
 
+## Demo App（可独立安装验证）
+
+`demo/` 是一个完整的演示 App：输入 RTMP 推流地址 → 相机+麦克风采集 → 推流，覆盖库的全部功能（零拷贝/H.265/AAC）。可直接 `hvigorw assembleHap` 出包安装到真机验证，不依赖任何业务后端。
+
+```bash
+hvigorw assembleHap --mode module -p product=default -p buildMode=debug --no-daemon
+hdc install demo/build/default/outputs/default/demo-default-unsigned.hap
+```
+
 ## 组成
 
 | 模块 | 说明 |

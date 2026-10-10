@@ -1,0 +1,8 @@
+{
+  "string": [
+    { "name": "app_name", "value": "rtmpush Demo" },
+    { "name": "demo_desc", "value": "rtmpush 推流库演示" },
+    { "name": "camera_reason", "value": "用于视频采集推流演示" },
+    { "name": "mic_reason", "value": "用于音频采集推流演示" }
+  ]
+}

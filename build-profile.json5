@@ -18,6 +18,11 @@
     {
       "name": "library",
       "srcPath": "./library"
+    },
+    {
+      "name": "demo",
+      "srcPath": "./demo",
+      "targets": [{ "name": "default", "applyToProducts": ["default"] }]
     }
   ]
 }

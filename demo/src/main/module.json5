@@ -1,0 +1,43 @@
+{
+  "module": {
+    "name": "demo",
+    "type": "entry",
+    "description": "rtmpush demo",
+    "mainElement": "DemoAbility",
+    "deviceTypes": ["phone"],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    "abilities": [
+      {
+        "name": "DemoAbility",
+        "srcEntry": "./ets/demoability/DemoAbility.ets",
+        "description": "$string:demo_desc",
+        "icon": "$media:app_icon",
+        "label": "$string:app_name",
+        "startWindowIcon": "$media:app_icon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "skills": [
+          {
+            "entities": ["entity.system.home"],
+            "actions": ["action.system.home"]
+          }
+        ]
+      }
+    ],
+    "requestPermissions": [
+      { "name": "ohos.permission.INTERNET" },
+      {
+        "name": "ohos.permission.CAMERA",
+        "reason": "$string:camera_reason",
+        "usedScene": { "abilities": ["DemoAbility"], "when": "inuse" }
+      },
+      {
+        "name": "ohos.permission.MICROPHONE",
+        "reason": "$string:mic_reason",
+        "usedScene": { "abilities": ["DemoAbility"], "when": "inuse" }
+      }
+    ]
+  }
+}
