@@ -146,6 +146,7 @@ napi_value CreateEncoder(napi_env env, napi_callback_info info) {
     OH_AVFormat_SetIntValue(format, OH_MD_KEY_FRAME_RATE, fps);
     OH_AVFormat_SetIntValue(format, OH_MD_KEY_I_FRAME_INTERVAL, iInterval);
     OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, 3); // NV21
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_VIDEO_ENCODE_BITRATE_MODE, BITRATE_MODE_VBR); // 同码率画质更好
 
     OH_AVCodecAsyncCallback cb = { OnError, OnStreamChanged, OnNeedInputData, OnNeedOutputData };
     OH_VideoEncoder_SetCallback(codec, cb, nullptr);
@@ -259,9 +260,24 @@ napi_value StopEncoder(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// 立即请求一个关键帧（新观众起播/降码率后画质快速恢复）
+napi_value RequestKeyFrame(napi_env env, napi_callback_info info) {
+    std::lock_guard<std::mutex> lock(g_ctx.mtx);
+    napi_value out;
+    if (!g_ctx.running || !g_ctx.codec) {
+        napi_get_boolean(env, false, &out);
+        return out;
+    }
+    OH_AVFormat *format = OH_AVFormat_Create();
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_REQUEST_I_FRAME, 1);
+    OH_AVErrCode ret = OH_VideoEncoder_SetParameter(g_ctx.codec, format);
+    OH_AVFormat_Destroy(format);
+    napi_get_boolean(env, ret == AV_ERR_OK, &out);
+    return out;
+}
+
 // 运行中动态改码率（自适应码流用），kbps
-napi_value SetVideoBitrate(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
+napi_value SetVideoBitrate(napi_env env, napi_callback_info info) {    size_t argc = 1;
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     int32_t kbps;
@@ -476,6 +492,7 @@ napi_value Init(napi_env env, napi_value exports) {
         { "stopEncoder", nullptr, StopEncoder, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "isRunning", nullptr, IsRunning, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setVideoBitrate", nullptr, SetVideoBitrate, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "requestKeyFrame", nullptr, RequestKeyFrame, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "createAudioEncoder", nullptr, CreateAudioEncoder, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "pushPcm", nullptr, PushPcm, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setAudioFrameCallback", nullptr, SetAudioFrameCallback, nullptr, nullptr, nullptr, napi_default, nullptr },

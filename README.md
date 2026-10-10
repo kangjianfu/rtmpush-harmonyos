@@ -69,6 +69,11 @@ H.265 推流：`createVideo(..., 'video/hevc')`，config 帧里抽 VPS(32)/SPS(3
 - 模拟器无 H.264 编码器，需真机调试
 - H.265 播放兼容性取决于拉流端（可用阿里云直播云端转码转 H.264 兜底）
 
+## 路线图
+
+- **v0.2 Surface 零拷贝编码**：`OH_VideoEncoder_GetSurface` 让相机直通编码器，消灭 NV21 内存拷贝（4K 时每帧省 12MB 拷贝，功耗显著下降）
+- 弱网增强：RTT 探测、丢帧统计上报
+
 ## License
 
 Apache-2.0

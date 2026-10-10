@@ -20,6 +20,7 @@ interface NativeModule {
   setFrameCallback(cb: (data: ArrayBuffer, ptsUs: number, flags: number) => void): boolean;
   stopEncoder(): boolean;
   setVideoBitrate(kbps: number): boolean;
+  requestKeyFrame(): boolean;
   isRunning(): boolean;
   createAudioEncoder(sampleRate: number, channels: number, bitrate: number): boolean;
   pushPcm(data: ArrayBufferLike): boolean;
@@ -71,6 +72,11 @@ export class PushEncoder {
   /** 运行中动态改视频码率（自适应码流用），返回是否成功 */
   setVideoBitrate(kbps: number): boolean {
     return native.setVideoBitrate(kbps);
+  }
+
+  /** 立即请求一个关键帧（新观众起播、降码率后画质快速恢复） */
+  requestKeyFrame(): boolean {
+    return native.requestKeyFrame();
   }
 
   /** 创建并启动 AAC 音频编码器（输入 PCM S16LE） */
