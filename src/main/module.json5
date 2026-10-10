@@ -1,0 +1,7 @@
+{
+  "module": {
+    "name": "rtmpush",
+    "type": "har",
+    "deviceTypes": ["phone", "tablet"]
+  }
+}
