@@ -4,6 +4,8 @@ import { promptAction } from '@kit.ArkUI';
 import { camera } from '@kit.CameraKit';
 import { image } from '@kit.ImageKit';
 import { audio } from '@kit.AudioKit';
+import { pasteboard } from '@kit.BasicServicesKit';
+import { scanBarcode, scanCore } from '@kit.ScanKit';
 import { abilityAccessCtrl, common } from '@kit.AbilityKit';
 import { RtmpClient, PushEncoder, VideoCodec, CODEC_FLAG_SYNC, CODEC_FLAG_CONFIG } from 'rtmpush';
 
@@ -304,6 +306,39 @@ struct Index {
     this.addLog('麦克风已启动');
   }
 
+  /** 扫码输入（系统扫码界面，识别二维码里的 RTMP 地址） */
+  private async scanUrl(): Promise<void> {
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      const result = await scanBarcode.startScanForResult(ctx);
+      const text = result.originalValue ?? '';
+      if (text.startsWith('rtmp://')) {
+        this.pushUrl = text;
+        this.addLog('扫码成功');
+      } else if (text.length > 0) {
+        promptAction.showToast({ message: '二维码内容不是 RTMP 地址' });
+      }
+    } catch (e) {
+      // 用户取消或设备不支持（模拟器无相机）
+    }
+  }
+
+  /** 从剪贴板粘贴推流地址 */
+  private pasteUrl(): void {
+    try {
+      const pb = pasteboard.getSystemPasteboard();
+      if (pb.hasDataSync()) {
+        const text = pb.getDataSync().getPrimaryText();
+        if (text && text.startsWith('rtmp://')) {
+          this.pushUrl = text;
+          this.addLog('已粘贴推流地址');
+          return;
+        }
+      }
+      promptAction.showToast({ message: '剪贴板里没有 RTMP 地址' });
+    } catch (e) { /* 忽略 */ }
+  }
+
   private stopAll(): void {
     this.pushing = false;
     if (this.fpsTimer >= 0) {
@@ -344,14 +379,6 @@ struct Index {
         .fontWeight(FontWeight.Medium)
         .width('100%')
         .margin({ top: 12 })
-
-      TextInput({ placeholder: 'rtmp://服务器/app/流名?auth_key=...', text: this.pushUrl })
-        .width('100%')
-        .height(44)
-        .enabled(!this.pushing)
-        .onChange((v: string) => {
-          this.pushUrl = v;
-        })
 
       XComponent({ id: 'demo_preview', type: XComponentType.SURFACE, controller: this.xController })
         .width('100%')
@@ -395,6 +422,39 @@ struct Index {
             .margin({ right: 8, bottom: 6 })
           .onClick(() => {
             this.zeroCopy = !this.zeroCopy;
+          })
+      }
+      .width('100%')
+
+      // 推流地址（大输入框 + 扫码 + 粘贴）
+      Row({ space: 8 }) {
+        TextInput({ placeholder: 'rtmp://服务器/app/流名?auth_key=...', text: this.pushUrl })
+          .height(56)
+          .fontSize(14)
+          .layoutWeight(1)
+          .enabled(!this.pushing)
+          .onChange((v: string) => {
+            this.pushUrl = v;
+          })
+        Button('扫码')
+          .height(56)
+          .fontSize(14)
+          .fontColor(Color.White)
+          .backgroundColor('#16a34a')
+          .borderRadius(8)
+          .enabled(!this.pushing)
+          .onClick(() => {
+            this.scanUrl();
+          })
+        Button('粘贴')
+          .height(56)
+          .fontSize(14)
+          .fontColor('#374151')
+          .backgroundColor('#e5e7eb')
+          .borderRadius(8)
+          .enabled(!this.pushing)
+          .onClick(() => {
+            this.pasteUrl();
           })
       }
       .width('100%')
