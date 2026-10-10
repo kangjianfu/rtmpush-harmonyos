@@ -426,32 +426,35 @@ struct Index {
       }
       .width('100%')
 
-      // 推流地址（大输入框 + 扫码 + 粘贴）
+      // 推流地址（多行大文本框，整行占满）
+      TextArea({ placeholder: 'rtmp://服务器/app/流名?auth_key=...', text: this.pushUrl })
+        .width('100%')
+        .height(110)
+        .fontSize(14)
+        .enabled(!this.pushing)
+        .onChange((v: string) => {
+          this.pushUrl = v;
+        })
+
       Row({ space: 8 }) {
-        TextInput({ placeholder: 'rtmp://服务器/app/流名?auth_key=...', text: this.pushUrl })
-          .height(56)
-          .fontSize(14)
-          .layoutWeight(1)
-          .enabled(!this.pushing)
-          .onChange((v: string) => {
-            this.pushUrl = v;
-          })
-        Button('扫码')
-          .height(56)
+        Button('扫码输入')
+          .height(44)
           .fontSize(14)
           .fontColor(Color.White)
           .backgroundColor('#16a34a')
           .borderRadius(8)
+          .layoutWeight(1)
           .enabled(!this.pushing)
           .onClick(() => {
             this.scanUrl();
           })
-        Button('粘贴')
-          .height(56)
+        Button('粘贴地址')
+          .height(44)
           .fontSize(14)
           .fontColor('#374151')
           .backgroundColor('#e5e7eb')
           .borderRadius(8)
+          .layoutWeight(1)
           .enabled(!this.pushing)
           .onClick(() => {
             this.pasteUrl();
