@@ -220,6 +220,7 @@ interface DigestLoc {
 export class RtmpClient {
   onLog: RtmpLog = () => {};
   onReady: () => void = () => {}; // publish 成功后可开始推流
+  onClosed: () => void = () => {}; // 连接意外断开（正常 close() 不触发），供上层做重连
 
   private tcp: socket.TCPSocket = socket.constructTCPSocketInstance();
   private info: RtmpUrlInfo | null = null;
@@ -260,8 +261,27 @@ export class RtmpClient {
         this.onData(new Uint8Array(data.message));
       }
     });
+    this.tcp.on('close', () => {
+      if (!this.closing) {
+        this.ready = false;
+        this.onLog('连接已断开');
+        this.onClosed();
+      }
+    });
+    this.tcp.on('error', () => {
+      if (!this.closing) {
+        this.ready = false;
+        this.onLog('连接错误');
+        this.onClosed();
+      }
+    });
     await this.doHandshake();
     await this.sendConnect();
+  }
+
+  /** 推流通道是否就绪（publish 成功） */
+  isReady(): boolean {
+    return this.ready;
   }
 
   private pushReceived(data: Uint8Array): void {
@@ -768,6 +788,9 @@ export class RtmpClient {
       while (this.sendStats.length > 0 && this.sendStats[0].t < cutoff) {
         this.sendStats.shift();
       }
+    }).catch(() => {
+      // 发送失败（断线）：吞掉让队列存活；断线重连由 onClosed 触发
+      this.ready = false;
     });
     return this.sendQueue;
   }
