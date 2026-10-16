@@ -84,7 +84,7 @@ await rtmp.connect('rtmp://your-server/app/streamKey');
 
 H.265 推流：`createVideo(..., 'video/hevc')`，config 帧里抽 VPS(32)/SPS(33)/PPS(34) 调 `rtmp.sendHevcConfig(vps, sps, pps, w, h, fps)`，推流前 `rtmp.setHevc(true)`。播放端需支持 Enhanced RTMP hvc1。
 
-自适应码流：用 `rtmp.getSendRateKbps()` 拿最近 3 秒实测上行速率，低于目标码流时调 `encoder.setVideoBitrate(kbps)` 动态降码率。
+自适应码流：每 1~2 秒调用 `rtmp.getSendRateKbps()` 获取最近 3 秒实测上行速率（`-1` 表示样本不足，此时不要调整码率）。连续低于当前视频码率时，调用 `encoder.setVideoBitrate(kbps)` 逐级降码率；网络恢复后再逐级回升，并设置最短调整间隔，避免码率频繁抖动。
 
 断线重连：挂 `rtmp.onClosed` 回调，断开后用同一实例重新 `connect()` 即可（相机/编码器不用停），重连成功后记得重发视频/音频序列头并 `encoder.requestKeyFrame()`（新通道没有对端状态）。建议指数退避（1s 起、30s 封顶）。
 
