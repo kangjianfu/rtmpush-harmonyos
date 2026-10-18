@@ -357,21 +357,28 @@ napi_value PushFrame(napi_env env, napi_callback_info info) {
 }
 
 // 输出帧回调桥：tsfn → ArkTS
+void FinalizeFrameEvent(napi_env env, void *finalizeData, void *finalizeHint) {
+    delete static_cast<FrameEvent *>(finalizeData);
+}
+
 void CallArkTsFrame(napi_env env, napi_value jsCb, void *context, void *data) {
     FrameEvent *ev = static_cast<FrameEvent *>(data);
     if (!ev) {
         return;
     }
     napi_value buffer;
-    void *bufData = nullptr;
-    napi_create_arraybuffer(env, ev->data.size(), &bufData, &buffer);
-    std::memcpy(bufData, ev->data.data(), ev->data.size());
+    // 直接把编码帧包装成 ArrayBuffer，不再额外复制一份；ev 由 GC 时的 finalizer 释放
+    napi_status status = napi_create_external_arraybuffer(
+        env, ev->data.data(), ev->data.size(), FinalizeFrameEvent, ev, &buffer);
+    if (status != napi_ok) {
+        delete ev;
+        return;
+    }
     napi_value pts, flags;
     napi_create_int64(env, ev->pts, &pts);
     napi_create_int32(env, ev->flags, &flags);
     napi_value argv[3] = { buffer, pts, flags };
     napi_call_function(env, nullptr, jsCb, 3, argv, nullptr);
-    delete ev;
 }
 
 napi_value SetFrameCallback(napi_env env, napi_callback_info info) {

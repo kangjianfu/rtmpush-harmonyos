@@ -949,9 +949,12 @@ export class RtmpClient {
   private sendStats: SendStat[] = [];
 
   private sendRaw(data: Uint8Array): Promise<void> {
+    // TCPSocket 只收 ArrayBuffer：subarray 必须截取实际范围，否则会把底层整个 buffer 发出去
+    const payload = data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
+      ? data.buffer : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     // 串行化发送，避免交错；完成后记账用于吞吐统计（自适应码流）
     this.sendQueue = this.sendQueue.then(() => {
-      return this.tcp.send({ data: data.buffer });
+      return this.tcp.send({ data: payload });
     }).then(() => {
       this.sendStats.push({ t: Date.now(), bytes: data.length });
       const cutoff = Date.now() - 4000;
