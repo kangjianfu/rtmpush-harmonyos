@@ -1,5 +1,7 @@
 # rtmpush — 鸿蒙原生 RTMP 推流库
 
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE) [![Platform](https://img.shields.io/badge/platform-HarmonyOS%20NEXT-blueviolet)](https://developer.huawei.com/consumer/cn/harmonyos) [![Deps](https://img.shields.io/badge/dependencies-0-brightgreen)](oh-package.json5)
+
 纯 HarmonyOS 实现的 RTMP 推流 SDK，**无任何第三方依赖**。阿里云 / 腾讯云 / 即构的推流 SDK 均无鸿蒙版本，本库填补这一空白。
 
 ## 集成方式
