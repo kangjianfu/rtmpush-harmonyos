@@ -50,6 +50,7 @@ hdc install demo/build/default/outputs/default/demo-default-unsigned.hap
 - AAC-LC 音频，自动发 AudioSpecificConfig 序列头
 - digest 握手（FP9，与 librtmp 算法一致，阿里云等需要鉴权握手的服务器可用）
 - 编码帧回调队列有上限，ArkTS 卡顿时丢帧防 OOM
+- 弱网背压：发送积压超阈值（默认 2MB，`setMaxPendingBytes` 可调）时按 GOP 丢帧，防止延迟滚雪球；`getPendingBytes()`/`getDropStats()` 可观测
 
 ## 快速开始
 

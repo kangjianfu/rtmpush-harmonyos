@@ -41,6 +41,7 @@ struct Index {
   @State statusText: string = '输入推流地址后开始';
   @State logs: string[] = [];
   @State fps: number = 0;
+  @State backlogKB: number = 0; // RTMP 发送队列积压（弱网观察用）
   @State resIndex: number = 1;
   @State codecIndex: number = 0;
   @State zeroCopy: boolean = true;
@@ -212,6 +213,7 @@ struct Index {
       this.fpsTimer = setInterval(() => {
         this.fps = this.frameCount;
         this.frameCount = 0;
+        this.backlogKB = Math.round(this.rtmp.getPendingBytes() / 1024);
       }, 1000);
     } catch (e) {
       this.statusText = '启动失败';
@@ -546,7 +548,7 @@ struct Index {
           .fontSize(13)
           .fontColor(this.pushing ? '#dc2626' : '#6b7280')
           .layoutWeight(1)
-        Text(`${this.fps}fps`)
+        Text(`${this.fps}fps 积压${this.backlogKB}KB`)
           .fontSize(12)
           .fontColor(this.pushing ? '#dc2626' : '#9ca3af')
       }

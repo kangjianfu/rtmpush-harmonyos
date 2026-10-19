@@ -47,10 +47,17 @@ struct RawFrame {
     int64_t pts; // 采集 pts（微秒），透传给编码器，保证输出 pts 同源
 };
 
+// 空闲输入 buffer 槽：回调到来但暂无数据时暂存，数据到达后立即消费，避免编码器饿死
+struct InputSlot {
+    uint32_t index;
+    OH_AVMemory *memory;
+};
+
 struct EncoderCtx {
     OH_AVCodec *codec = nullptr;
     napi_threadsafe_function tsfn = nullptr;
     std::queue<RawFrame> pending;               // 待编码 NV21 帧（buffer 模式）
+    std::vector<InputSlot> freeInputs;          // 空闲输入 buffer 槽
     std::mutex mtx;
     bool running = false;
     bool surfaceMode = false;                   // surface 零拷贝模式（相机直通）
@@ -78,31 +85,50 @@ void OnStreamChanged(OH_AVCodec *codec, OH_AVFormat *format, void *userData) {
     LOGI("stream changed");
 }
 
+// 调用方须持有 g_ctx.mtx
+void DrainVideoInputLocked() {
+    while (g_ctx.running && g_ctx.codec && !g_ctx.pending.empty() && !g_ctx.freeInputs.empty()) {
+        InputSlot slot = g_ctx.freeInputs.front();
+        g_ctx.freeInputs.erase(g_ctx.freeInputs.begin());
+        RawFrame frame = std::move(g_ctx.pending.front());
+        g_ctx.pending.pop();
+        g_ctx.queuedBytes -= frame.data.size();
+        OH_AVCodecBufferAttr attr;
+        attr.pts = frame.pts; // 采集 pts 透传，输出帧 pts 与音频同源可对齐
+        attr.offset = 0;
+        uint8_t *addr = slot.memory ? OH_AVMemory_GetAddr(slot.memory) : nullptr;
+        int32_t cap = slot.memory ? OH_AVMemory_GetSize(slot.memory) : 0;
+        if (!addr || static_cast<int32_t>(frame.data.size()) > cap) {
+            // 截断的 NV21 是花屏源头，整帧丢弃
+            LOGE("frame too big %{public}zu > %{public}d, dropped", frame.data.size(), cap);
+            attr.size = 0;
+            attr.flags = AVCODEC_BUFFER_FLAGS_DISCARD;
+        } else {
+            std::memcpy(addr, frame.data.data(), frame.data.size());
+            attr.size = frame.data.size();
+            attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
+        }
+        OH_VideoEncoder_PushInputData(g_ctx.codec, slot.index, attr);
+    }
+}
+
 void OnNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, void *userData) {
     std::lock_guard<std::mutex> lock(g_ctx.mtx);
-    if (!g_ctx.running || g_ctx.pending.empty() || !data) {
-        return; // 没帧就跳过这轮（buffer 自动回收）
+    if (!g_ctx.running || !data) {
+        return;
     }
-    RawFrame frame = std::move(g_ctx.pending.front());
-    g_ctx.pending.pop();
-    g_ctx.queuedBytes -= frame.data.size();
-    uint8_t *addr = OH_AVMemory_GetAddr(data);
-    int32_t cap = OH_AVMemory_GetSize(data);
-    int32_t len = std::min(static_cast<int32_t>(frame.data.size()), cap);
-    std::memcpy(addr, frame.data.data(), len);
-    OH_AVCodecBufferAttr attr;
-    attr.pts = frame.pts; // 采集 pts 透传，输出帧 pts 与音频同源可对齐
-    attr.size = len;
-    attr.offset = 0;
-    attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
-    OH_VideoEncoder_PushInputData(codec, index, attr);
+    g_ctx.freeInputs.push_back({ index, data });
+    DrainVideoInputLocked();
 }
 
 void OnNeedOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, OH_AVCodecBufferAttr *attr, void *userData) {
-    napi_threadsafe_function tsfn;
+    napi_threadsafe_function tsfn = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_ctx.mtx);
-        tsfn = g_ctx.tsfn; // SetFrameCallback 可能并发释放，持锁读取
+        if (g_ctx.running && g_ctx.tsfn) {
+            tsfn = g_ctx.tsfn;
+            napi_acquire_threadsafe_function(tsfn); // 防止使用中 SetFrameCallback/Stop 释放
+        }
     }
     if (!attr || !data || !tsfn) {
         OH_VideoEncoder_FreeOutputBuffer(codec, index); // 不消费也必须还 buffer，否则编码器停摆
@@ -116,6 +142,7 @@ void OnNeedOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, OH_A
     if (napi_call_threadsafe_function(tsfn, ev, napi_tsfn_nonblocking) != napi_ok) {
         delete ev; // 队列满：丢帧防内存膨胀
     }
+    napi_release_threadsafe_function(tsfn, napi_tsfn_release);
     OH_VideoEncoder_FreeOutputBuffer(codec, index);
 }
 
@@ -148,6 +175,7 @@ OH_AVCodec *CreateVideoEncoderByMime(const char *mime) {
 void StopVideoInternal() {
     OH_AVCodec *codec = nullptr;
     OHNativeWindow *window = nullptr;
+    napi_threadsafe_function tsfn = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_ctx.mtx);
         g_ctx.running = false;
@@ -155,8 +183,11 @@ void StopVideoInternal() {
         g_ctx.codec = nullptr;
         window = g_ctx.window;
         g_ctx.window = nullptr;
+        tsfn = g_ctx.tsfn;
+        g_ctx.tsfn = nullptr;
         g_ctx.surfaceMode = false;
         g_ctx.pending = std::queue<RawFrame>();
+        g_ctx.freeInputs.clear();
         g_ctx.queuedBytes = 0;
     }
     if (codec) {
@@ -165,6 +196,10 @@ void StopVideoInternal() {
     }
     if (window) {
         OH_NativeWindow_DestroyNativeWindow(window);
+    }
+    // 先销毁编码器（不再产生输出回调），再释放 tsfn
+    if (tsfn) {
+        napi_release_threadsafe_function(tsfn, napi_tsfn_release);
     }
 }
 
@@ -189,6 +224,7 @@ napi_value CreateEncoder(napi_env env, napi_callback_info info) {
 
     std::lock_guard<std::mutex> lock(g_ctx.mtx);
     g_ctx.pending = std::queue<RawFrame>();
+    g_ctx.freeInputs.clear();
     g_ctx.queuedBytes = 0;
 
     if (g_ctx.codec) {
@@ -337,7 +373,8 @@ napi_value PushFrame(napi_env env, napi_callback_info info) {
 
     napi_value out;
     std::lock_guard<std::mutex> lock(g_ctx.mtx);
-    if (!g_ctx.running || !g_ctx.codec) {
+    if (!g_ctx.running || !g_ctx.codec || g_ctx.surfaceMode) {
+        // surface 零拷贝模式下相机直通编码器，不应再喂 buffer 帧
         napi_get_boolean(env, false, &out);
         return out;
     }
@@ -352,6 +389,7 @@ napi_value PushFrame(napi_env env, napi_callback_info info) {
     frame.pts = pts;
     g_ctx.pending.push(std::move(frame));
     g_ctx.queuedBytes += len;
+    DrainVideoInputLocked();
     napi_get_boolean(env, true, &out);
     return out;
 }
@@ -385,13 +423,23 @@ napi_value SetFrameCallback(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    if (g_ctx.tsfn) {
-        napi_release_threadsafe_function(g_ctx.tsfn, napi_tsfn_release);
+    napi_threadsafe_function oldTsfn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.mtx);
+        oldTsfn = g_ctx.tsfn;
         g_ctx.tsfn = nullptr;
+    }
+    if (oldTsfn) {
+        napi_release_threadsafe_function(oldTsfn, napi_tsfn_release);
     }
     napi_value name;
     napi_create_string_utf8(env, "push_encoder_frame", NAPI_AUTO_LENGTH, &name);
-    napi_create_threadsafe_function(env, args[0], nullptr, name, 90, 1, nullptr, nullptr, nullptr, CallArkTsFrame, &g_ctx.tsfn);
+    napi_threadsafe_function tsfn = nullptr;
+    napi_create_threadsafe_function(env, args[0], nullptr, name, 90, 1, nullptr, nullptr, nullptr, CallArkTsFrame, &tsfn);
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.mtx);
+        g_ctx.tsfn = tsfn;
+    }
     napi_value out;
     napi_get_boolean(env, true, &out);
     return out;
@@ -458,6 +506,7 @@ struct AudioEncoderCtx {
     OH_AVCodec *codec = nullptr;
     napi_threadsafe_function tsfn = nullptr;
     std::queue<std::vector<uint8_t>> pending; // 待编码 PCM（S16LE）
+    std::vector<InputSlot> freeInputs;        // 空闲输入 buffer 槽
     std::mutex mtx;
     bool running = false;
     int64_t ptsUs = 0;
@@ -475,32 +524,51 @@ void OnAudioStreamChanged(OH_AVCodec *codec, OH_AVFormat *format, void *userData
     LOGI("audio stream changed");
 }
 
+// 调用方须持有 g_audio.mtx
+void DrainAudioInputLocked() {
+    while (g_audio.running && g_audio.codec && !g_audio.pending.empty() && !g_audio.freeInputs.empty()) {
+        InputSlot slot = g_audio.freeInputs.front();
+        g_audio.freeInputs.erase(g_audio.freeInputs.begin());
+        std::vector<uint8_t> pcm = std::move(g_audio.pending.front());
+        g_audio.pending.pop();
+        OH_AVCodecBufferAttr attr;
+        attr.pts = g_audio.ptsUs;
+        attr.offset = 0;
+        uint8_t *addr = slot.memory ? OH_AVMemory_GetAddr(slot.memory) : nullptr;
+        int32_t cap = slot.memory ? OH_AVMemory_GetSize(slot.memory) : 0;
+        if (!addr || static_cast<int32_t>(pcm.size()) > cap) {
+            LOGE("pcm block too big %{public}zu > %{public}d, dropped", pcm.size(), cap);
+            attr.size = 0;
+            attr.flags = AVCODEC_BUFFER_FLAGS_DISCARD;
+        } else {
+            std::memcpy(addr, pcm.data(), pcm.size());
+            attr.size = pcm.size();
+            attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
+        }
+        // pts 按块时长推进（即使丢弃也推进，保证时间轴不压缩）
+        int64_t samples = static_cast<int64_t>(pcm.size()) / (2 * g_audio.channels);
+        g_audio.ptsUs += samples * 1000000 / g_audio.sampleRate;
+        OH_AudioEncoder_PushInputData(g_audio.codec, slot.index, attr);
+    }
+}
+
 void OnAudioNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, void *userData) {
     std::lock_guard<std::mutex> lock(g_audio.mtx);
-    if (!g_audio.running || g_audio.pending.empty() || !data) {
+    if (!g_audio.running || !data) {
         return;
     }
-    std::vector<uint8_t> pcm = std::move(g_audio.pending.front());
-    g_audio.pending.pop();
-    uint8_t *addr = OH_AVMemory_GetAddr(data);
-    int32_t cap = OH_AVMemory_GetSize(data);
-    int32_t len = std::min(static_cast<int32_t>(pcm.size()), cap);
-    std::memcpy(addr, pcm.data(), len);
-    OH_AVCodecBufferAttr attr;
-    attr.pts = g_audio.ptsUs;
-    attr.size = len;
-    attr.offset = 0;
-    attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
-    int64_t samples = len / (2 * g_audio.channels);
-    g_audio.ptsUs += samples * 1000000 / g_audio.sampleRate;
-    OH_AudioEncoder_PushInputData(codec, index, attr);
+    g_audio.freeInputs.push_back({ index, data });
+    DrainAudioInputLocked();
 }
 
 void OnAudioNeedOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, OH_AVCodecBufferAttr *attr, void *userData) {
-    napi_threadsafe_function tsfn;
+    napi_threadsafe_function tsfn = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_audio.mtx);
-        tsfn = g_audio.tsfn;
+        if (g_audio.running && g_audio.tsfn) {
+            tsfn = g_audio.tsfn;
+            napi_acquire_threadsafe_function(tsfn);
+        }
     }
     if (!attr || !data || !tsfn) {
         OH_AudioCodec_FreeOutputBuffer(codec, index);
@@ -514,6 +582,7 @@ void OnAudioNeedOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data,
     if (napi_call_threadsafe_function(tsfn, ev, napi_tsfn_nonblocking) != napi_ok) {
         delete ev; // 队列满：丢帧防内存膨胀
     }
+    napi_release_threadsafe_function(tsfn, napi_tsfn_release);
     OH_AudioCodec_FreeOutputBuffer(codec, index);
 }
 
@@ -532,6 +601,7 @@ napi_value CreateAudioEncoder(napi_env env, napi_callback_info info) {
         return nullptr;
     }
     g_audio.pending = std::queue<std::vector<uint8_t>>();
+    g_audio.freeInputs.clear();
     g_audio.ptsUs = 0;
     g_audio.sampleRate = sampleRate;
     g_audio.channels = channels;
@@ -597,12 +667,17 @@ napi_value PushPcm(napi_env env, napi_callback_info info) {
         return out;
     }
     // PCM 队列限长（readData 每块约几毫秒，限 100 块防堆积导致音画漂移）
+    // 丢块时必须按块时长推进 ptsUs，否则音频时间轴被压缩、音画逐渐失步
     if (g_audio.pending.size() >= 100) {
+        const std::vector<uint8_t> &dropped = g_audio.pending.front();
+        int64_t samples = static_cast<int64_t>(dropped.size()) / (2 * g_audio.channels);
+        g_audio.ptsUs += samples * 1000000 / g_audio.sampleRate;
         g_audio.pending.pop();
     }
     std::vector<uint8_t> pcm(len);
     std::memcpy(pcm.data(), data, len);
     g_audio.pending.push(std::move(pcm));
+    DrainAudioInputLocked();
     napi_value out;
     napi_get_boolean(env, true, &out);
     return out;
@@ -612,13 +687,23 @@ napi_value SetAudioFrameCallback(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    if (g_audio.tsfn) {
-        napi_release_threadsafe_function(g_audio.tsfn, napi_tsfn_release);
+    napi_threadsafe_function oldTsfn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_audio.mtx);
+        oldTsfn = g_audio.tsfn;
         g_audio.tsfn = nullptr;
+    }
+    if (oldTsfn) {
+        napi_release_threadsafe_function(oldTsfn, napi_tsfn_release);
     }
     napi_value name;
     napi_create_string_utf8(env, "push_encoder_audio_frame", NAPI_AUTO_LENGTH, &name);
-    napi_create_threadsafe_function(env, args[0], nullptr, name, 300, 1, nullptr, nullptr, nullptr, CallArkTsFrame, &g_audio.tsfn);
+    napi_threadsafe_function tsfn = nullptr;
+    napi_create_threadsafe_function(env, args[0], nullptr, name, 300, 1, nullptr, nullptr, nullptr, CallArkTsFrame, &tsfn);
+    {
+        std::lock_guard<std::mutex> lock(g_audio.mtx);
+        g_audio.tsfn = tsfn;
+    }
     napi_value out;
     napi_get_boolean(env, true, &out);
     return out;
@@ -626,17 +711,24 @@ napi_value SetAudioFrameCallback(napi_env env, napi_callback_info info) {
 
 napi_value StopAudioEncoder(napi_env env, napi_callback_info info) {
     OH_AVCodec *codec = nullptr;
+    napi_threadsafe_function tsfn = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_audio.mtx);
         g_audio.running = false;
         codec = g_audio.codec;
         g_audio.codec = nullptr;
+        tsfn = g_audio.tsfn;
+        g_audio.tsfn = nullptr;
         g_audio.pending = std::queue<std::vector<uint8_t>>();
+        g_audio.freeInputs.clear();
     }
     // Stop/Destroy 在锁外执行，避免与编码器回调线程死锁
     if (codec) {
         OH_AudioEncoder_Stop(codec);
         OH_AudioEncoder_Destroy(codec);
+    }
+    if (tsfn) {
+        napi_release_threadsafe_function(tsfn, napi_tsfn_release);
     }
     napi_value out;
     napi_get_boolean(env, true, &out);

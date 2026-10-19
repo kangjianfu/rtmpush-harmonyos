@@ -48,12 +48,15 @@ export function parseRtmpUrl(url: string): RtmpUrlInfo {
   let port = 1935;
   let app = '';
   let streamKey = '';
+  if (u.startsWith('rtmps://')) {
+    throw new Error('暂不支持 rtmps（TLS），请用 rtmp:// 地址');
+  }
   if (u.startsWith('rtmp://')) {
     u = u.slice(7);
   }
   const slash = u.indexOf('/');
-  host = u.slice(0, slash);
-  const rest = u.slice(slash + 1);
+  host = slash >= 0 ? u.slice(0, slash) : u;
+  const rest = slash >= 0 ? u.slice(slash + 1) : '';
   if (host.includes(':')) {
     const idx = host.lastIndexOf(':');
     port = parseInt(host.slice(idx + 1)) || 1935;
@@ -296,6 +299,11 @@ interface ChunkMsg {
   extended: boolean;
 }
 
+export interface DropStats {
+  video: number;
+  audio: number;
+}
+
 export class RtmpClient {
   onLog: RtmpLog = () => {};
   onReady: () => void = () => {}; // publish 成功后可开始推流
@@ -322,6 +330,13 @@ export class RtmpClient {
   private winAckSize: number = 2500000; // 对端 Window Acknowledgement Size（常见默认值）
   private totalBytesIn: number = 0;
   private bytesInSinceAck: number = 0;
+  private pendingBytes: number = 0; // 已入队未发送完成的字节数（弱网背压依据）
+  private sendGen: number = 0; // 重连后代号：旧连接的迟到回执不再记账
+  private maxPendingBytes: number = 2 * 1024 * 1024; // 背压阈值，超过开始丢媒体帧
+  private dropUntilKey: boolean = false; // 丢过视频帧后，到下个关键帧前持续丢（防花屏）
+  private droppedVideo: number = 0;
+  private droppedAudio: number = 0;
+  private congested: boolean = false;
 
   /** 有音频时先告知（影响 onMetaData 的 audiocodecid 与 AAC 序列头） */
   setAudioInfo(sampleRate: number, channels: number): void {
@@ -356,6 +371,12 @@ export class RtmpClient {
     this.audioBaseTs = -1;
     this.totalBytesIn = 0;
     this.bytesInSinceAck = 0;
+    this.pendingBytes = 0;
+    this.sendGen++;
+    this.dropUntilKey = false;
+    this.droppedVideo = 0;
+    this.droppedAudio = 0;
+    this.congested = false;
 
     this.info = parseRtmpUrl(url);
     this.onLog(`连接 ${this.info.host}:${this.info.port}`);
@@ -364,6 +385,10 @@ export class RtmpClient {
       timeout: 10000
     });
     tcp.on('message', (data: socket.SocketMessageInfo) => {
+      // 旧 socket 的迟到数据不混入新连接的解析缓冲（重连场景）
+      if (this.tcp !== tcp) {
+        return;
+      }
       if (data.message) {
         this.onData(new Uint8Array(data.message));
       }
@@ -392,6 +417,21 @@ export class RtmpClient {
   /** 推流通道是否就绪（publish 成功） */
   isReady(): boolean {
     return this.ready;
+  }
+
+  /** 弱网背压阈值（字节）。发送队列积压超过该值时开始丢媒体帧，默认 2MB */
+  setMaxPendingBytes(bytes: number): void {
+    this.maxPendingBytes = Math.max(64 * 1024, Math.round(bytes));
+  }
+
+  /** 当前发送队列积压字节数 */
+  getPendingBytes(): number {
+    return this.pendingBytes;
+  }
+
+  /** 本次连接内因弱网丢掉的媒体帧数 */
+  getDropStats(): DropStats {
+    return { video: this.droppedVideo, audio: this.droppedAudio };
   }
 
   private pushReceived(data: Uint8Array): void {
@@ -810,6 +850,10 @@ export class RtmpClient {
 
   /** 发送一帧 AAC（raw，无 ADTS），pts 毫秒（缺省按发送时刻） */
   async sendAudioFrame(aac: Uint8Array, ptsMs?: number): Promise<void> {
+    if (this.shouldDropMedia()) {
+      this.droppedAudio++;
+      return;
+    }
     const body = new BufWriter();
     body.u8(0xaf);
     body.u8(0x01); // AAC raw
@@ -819,6 +863,20 @@ export class RtmpClient {
 
   /** 发送一帧 H.264/H.265（annex-b），isKey 关键帧，dts 毫秒（缺省按发送时刻） */
   async sendVideoFrame(annexb: Uint8Array, isKey: boolean, dts?: number): Promise<void> {
+    if (this.dropUntilKey) {
+      if (!isKey) {
+        this.droppedVideo++;
+        return;
+      }
+      // 关键帧是恢复点：即使仍拥塞也发送，让播放端尽快恢复
+      this.dropUntilKey = false;
+      this.onLog(`关键帧恢复发送（本次拥塞丢视频 ${this.droppedVideo} 帧、音频 ${this.droppedAudio} 帧）`);
+    } else if (this.shouldDropMedia()) {
+      // 无论丢的是不是关键帧，GOP 内后续帧都会引用它，必须丢到下一个关键帧为止
+      this.droppedVideo++;
+      this.dropUntilKey = true;
+      return;
+    }
     // annex-b → AVCC（长度前缀）
     const nals = splitAnnexB(annexb);
     if (nals.length === 0) {
@@ -826,8 +884,8 @@ export class RtmpClient {
     }
     const body = new BufWriter();
     if (this.hevc) {
-      // Enhanced RTMP：FrameType(高4位) | 0x08(ExHeader 标志) | PacketType(低3位)，单字节
-      body.u8(((isKey ? 1 : 2) << 4) | 0x08 | 0x01); // PacketType=1 CodedFrames
+      // Enhanced RTMP v2：byte0 = IsExHeader(0x80) | FrameType(高3位) | PacketType(低4位)，fourcc 紧随其后
+      body.u8(0x80 | ((isKey ? 1 : 2) << 4) | 0x01); // PacketType=1 CodedFrames
       body.bytes([0x68, 0x76, 0x63, 0x31]); // 'hvc1'
       body.u24be(0); // composition time offset（无 B 帧恒为 0）
     } else {
@@ -840,6 +898,22 @@ export class RtmpClient {
       body.bytes(nal);
     }
     await this.sendMessage(4, MSG_VIDEO, this.streamId, body.build(), this.normTs(dts, true));
+  }
+
+  /** 弱网背压：发送积压超阈值时丢媒体帧（控制消息/序列头不丢） */
+  private shouldDropMedia(): boolean {
+    if (this.pendingBytes <= this.maxPendingBytes) {
+      if (this.congested) {
+        this.congested = false;
+        this.onLog('发送积压恢复正常');
+      }
+      return false;
+    }
+    if (!this.congested) {
+      this.congested = true;
+      this.onLog(`发送积压 ${(this.pendingBytes / 1024).toFixed(0)}KB 超阈值，开始丢帧`);
+    }
+    return true;
   }
 
   /** 发送 H.265 序列头（VPS/SPS/PPS → hvcC，Enhanced RTMP PacketType=0） */
@@ -873,7 +947,7 @@ export class RtmpClient {
       hvcc.bytes(nalData[i]);
     }
     const body = new BufWriter();
-    body.u8(0x18); // FrameType=1(关键帧) | ExHeader(0x08) | PacketType=0(SequenceStart)，单字节
+    body.u8(0x80 | (1 << 4) | 0x00); // IsExHeader | FrameType=1(关键帧) | PacketType=0(SequenceStart)
     body.bytes([0x68, 0x76, 0x63, 0x31]); // 'hvc1'
     body.bytes(hvcc.build());
     await this.sendMessage(4, MSG_VIDEO, this.streamId, body.build(), 0);
@@ -952,10 +1026,16 @@ export class RtmpClient {
     // TCPSocket 只收 ArrayBuffer：subarray 必须截取实际范围，否则会把底层整个 buffer 发出去
     const payload = data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
       ? data.buffer : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+    const gen = this.sendGen;
+    this.pendingBytes += payload.byteLength;
     // 串行化发送，避免交错；完成后记账用于吞吐统计（自适应码流）
     this.sendQueue = this.sendQueue.then(() => {
       return this.tcp.send({ data: payload });
     }).then(() => {
+      if (gen !== this.sendGen) {
+        return;
+      }
+      this.pendingBytes -= payload.byteLength;
       this.sendStats.push({ t: Date.now(), bytes: data.length });
       const cutoff = Date.now() - 4000;
       while (this.sendStats.length > 0 && this.sendStats[0].t < cutoff) {
@@ -963,7 +1043,10 @@ export class RtmpClient {
       }
     }).catch(() => {
       // 发送失败（断线）：吞掉让队列存活；断线重连由 onClosed 触发
-      this.ready = false;
+      if (gen === this.sendGen) {
+        this.pendingBytes -= payload.byteLength;
+        this.ready = false;
+      }
     });
     return this.sendQueue;
   }

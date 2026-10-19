@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1
+
+性能与弱网优化：
+
+- **弱网背压**：发送队列按字节计数，超过阈值（默认 2MB，`setMaxPendingBytes()` 可调）时按 GOP 丢视频帧（丢一帧后持续到下个关键帧，防花屏），拥塞时音频同样丢弃；关键帧是恢复点，始终发送；新增 `getPendingBytes()`/`getDropStats()` 观测接口
+- **编码输出零拷贝**：native 编码帧经 `napi_create_external_arraybuffer` 直通 ArkTS，每帧少一次完整 memcpy
+- **发送范围修正**：`subarray` 数据不再误发整个底层 buffer（简单握手的 C2 会多发字节）；完整 buffer 仍零拷贝
+- **H.265 Enhanced RTMP 封装修正**：byte0 按规范使用 IsExHeader 位（0x80）；此前误用 0x08，导致标准服务器与 rtmpull 拉流端都会丢弃 H.265 帧
+- **编码器输入 buffer 槽缓存**：相机帧间隙不再造成编码器输入饿死；超输入 buffer 的 NV21 帧整帧丢弃（原截断会花屏）
+- **弱网音频丢块保持时间轴**：PCM 队列丢块时同步推进 pts，避免音画逐渐失步
+- native tsfn 生命周期与竞态修复（每次推流会话不再泄漏 threadsafe function）
+- RtmpClient：旧 socket 迟到数据不再污染重连后的新连接；`rtmps://` 明确报错；无路径 URL 解析修正
+- demo：状态行显示发送积压 KB
+
 ## 0.2.0
 
 修复与协议完善（建议所有用户升级）：
